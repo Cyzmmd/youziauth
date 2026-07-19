@@ -1,0 +1,45 @@
+# Local credentials and machine-specific configuration
+config.ini
+campus_auth_password.txt
+credential.dat
+*.credential
+
+# Runtime logs and state
+*.log
+*.log.*
+*.pid
+*.tmp
+*.temp
+
+# Generated installers and build tools
+.tools/
+build/
+dist/
+*.msi
+
+# Python caches, test output, and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+env/
+
+# Internal agent design and execution notes
+docs/superpowers/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
