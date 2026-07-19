@@ -40,7 +40,23 @@ make Tkinter look broken even when the same Python works normally.
 - Right-click tray icon and verify Show, Settings, Check Now, and Exit.
 - Uninstall from Windows Apps and Features.
 
-## 2026-07-19 System-Boot Release Evidence
+## 2026-07-19 Public Release Evidence
+
+- Release version: `1.1.3`.
+- Automated tests: 123 passed with zero failures (`python -m unittest discover -s tests`).
+- Python source and test files compiled successfully with `python -m py_compile`.
+- PyInstaller: 6.16.0; Python: 3.14.0; WiX 7 build pipeline completed successfully.
+- MSI: `dist\youziauth.msi`, 15,402,008 bytes.
+- MSI SHA-256: `E37C39DDB9A54E62FE6C72B00E1511F565A73BCB99DB6AE4A3AE124D83882213`.
+- WiX MSI validation: exit code 0.
+- Packaged file count: 1,008.
+- The package includes `THIRD_PARTY_NOTICES.md` plus the CPython 3.14, PyInstaller 6.16, and Pillow 12.2 license files.
+- Pillow is build-only; no Pillow runtime package files are present in the application bundle.
+- Packaged tree contains zero `config.ini`, `credential.dat`, `campus_auth_password.txt`, or `campus_auth.log` files.
+- Binary scans found no copy of the local password, password-file value, login URL, Windows user name, user-profile path, or Git commit email.
+- Git tracks none of the sensitive runtime files above, and the release commit contains no local password or login URL value.
+
+## 2026-07-19 System-Boot Pre-Release Evidence
 
 - Automated tests: 122 passed with zero failures (`python -m unittest discover -s tests -v`).
 - PyInstaller: 6.16.0; WiX: 7 build pipeline completed successfully.

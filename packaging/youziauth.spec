@@ -8,6 +8,8 @@ ROOT = Path.cwd()
 datas = [
     (str(ROOT / "config.example.ini"), "."),
     (str(ROOT / "assets"), "assets"),
+    (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(ROOT / "third_party_licenses"), "third_party_licenses"),
 ]
 
 gui_analysis = Analysis(

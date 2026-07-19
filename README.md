@@ -197,4 +197,6 @@ Copyright (C) 2026 yoouzic
 
 本项目仅按 **GNU General Public License version 3** 发布，SPDX 标识为 `GPL-3.0-only`。完整条款见 [LICENSE](LICENSE)。
 
+Windows 安装包所含第三方组件及其许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 除非文件中另有说明，`assets/` 内的图片和图标由 `yoouzic` 生成并持有版权，随本项目按 GPL-3.0-only 发布。

@@ -10,6 +10,23 @@ import make_icons  # noqa: E402
 
 
 class PackagingWorkflowTests(unittest.TestCase):
+    def test_pyinstaller_bundle_includes_third_party_license_materials(self):
+        spec = ROOT.joinpath("packaging", "youziauth.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertTrue(ROOT.joinpath("THIRD_PARTY_NOTICES.md").exists())
+        self.assertTrue(
+            ROOT.joinpath("third_party_licenses", "CPYTHON-3.14-LICENSE.txt").exists()
+        )
+        self.assertTrue(
+            ROOT.joinpath(
+                "third_party_licenses", "PYINSTALLER-6.16-COPYING.txt"
+            ).exists()
+        )
+        self.assertIn("THIRD_PARTY_NOTICES.md", spec)
+        self.assertIn("third_party_licenses", spec)
+
     def test_pyinstaller_spec_builds_gui_and_system_agent_without_user_secrets(self):
         spec = ROOT.joinpath("packaging", "youziauth.spec").read_text(
             encoding="utf-8"
