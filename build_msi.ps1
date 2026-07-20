@@ -30,22 +30,18 @@ function Resolve-Python {
     throw "Python was not found. Install Python 3.10+ or pass -PythonPath C:\Path\To\python.exe"
 }
 
-function Ensure-PyInstaller {
+function Ensure-PythonBuildDependencies {
     param([string]$Python)
-    & $Python -m PyInstaller --version | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        return
+    $Requirements = Join-Path $Root "requirements-build.txt"
+    if ($InstallDependencies) {
+        & $Python -m pip install --requirement $Requirements
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install pinned Python build dependencies"
+        }
     }
-    if (-not $InstallDependencies) {
-        throw "PyInstaller is not installed. Re-run with -InstallDependencies or install it with: $Python -m pip install pyinstaller"
-    }
-    & $Python -m pip install pyinstaller
+    & $Python -c "import PIL, PyInstaller; assert PIL.__version__ == '12.2.0'; assert PyInstaller.__version__ == '6.16.0'"
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install PyInstaller"
-    }
-    & $Python -m PyInstaller --version | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "PyInstaller is still not available after installation"
+        throw "Pinned Python build dependencies are unavailable"
     }
 }
 
@@ -77,7 +73,7 @@ function Resolve-Wix {
 }
 
 $Python = Resolve-Python $PythonPath
-Ensure-PyInstaller $Python
+Ensure-PythonBuildDependencies $Python
 $Wix = Resolve-Wix
 
 & $Python (Join-Path $PackagingDir "make_icons.py")

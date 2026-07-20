@@ -13,6 +13,17 @@ import make_icons  # noqa: E402
 
 
 class PackagingWorkflowTests(unittest.TestCase):
+    def test_build_dependencies_are_exactly_pinned(self):
+        lines = [
+            line.strip()
+            for line in ROOT.joinpath("requirements-build.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        self.assertEqual(lines, ["Pillow==12.2.0", "PyInstaller==6.16.0"])
+        self.assertTrue(all("==" in line for line in lines))
+
     def test_pyinstaller_bundle_includes_third_party_license_materials(self):
         spec = ROOT.joinpath("packaging", "youziauth.spec").read_text(
             encoding="utf-8"
@@ -80,7 +91,7 @@ class PackagingWorkflowTests(unittest.TestCase):
     def test_msi_build_script_runs_pyinstaller_then_wix(self):
         script = ROOT.joinpath("build_msi.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("pyinstaller", script)
+        self.assertIn("PyInstaller", script)
         self.assertIn("wix.exe", script)
         self.assertIn("youziauth.msi", script)
         self.assertIn("youziauth.spec", script)
