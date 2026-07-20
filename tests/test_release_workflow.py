@@ -48,6 +48,17 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("gh release create", text)
         self.assertNotIn("dist/youziauth.msi ${{", text)
 
+    def test_release_audit_requires_valid_signatures_versions_and_hashes(self):
+        text = ROOT.joinpath("packaging", "verify_release.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Get-AuthenticodeSignature", text)
+        self.assertIn("Status -ne 'Valid'", text)
+        self.assertIn("msiexec.exe", text)
+        self.assertIn("FileVersion", text)
+        self.assertIn("SHA256SUMS.txt", text)
+        self.assertIn("release-provenance.json", text)
+
 
 if __name__ == "__main__":
     unittest.main()
