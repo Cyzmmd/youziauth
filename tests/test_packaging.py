@@ -1,5 +1,8 @@
 from pathlib import Path
+import re
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -98,7 +101,7 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("ProgramMenuFolder", source)
         self.assertIn("Shortcut", source)
         self.assertIn("youziauth.exe", source)
-        self.assertIn('Version="1.1.3"', source)
+        self.assertIn('Version="$(var.ProductVersion)"', source)
         self.assertIn("System.AppUserModel.ID", source)
         self.assertIn('Value="youziauth"', source)
         self.assertNotIn("Campus Network Auth", source)
@@ -121,6 +124,52 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("URL Protocol", source)
         self.assertIn("--notification-action", source)
         self.assertIn("ProtocolRegistrationComponent", source)
+
+
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_version_file_is_strict_semver(self):
+        version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
+        self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
+    def test_wix_version_comes_from_build_variable(self):
+        source = ROOT.joinpath("packaging", "youziauth.wxs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('Version="$(var.ProductVersion)"', source)
+        self.assertNotIn('Version="1.1.3"', source)
+
+    def test_pyinstaller_uses_generated_version_resources_without_upx(self):
+        source = ROOT.joinpath("packaging", "youziauth.spec").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('version=str(VERSION_DIR / "youziauth.version")', source)
+        self.assertIn(
+            'version=str(VERSION_DIR / "youziauth-agent.version")', source
+        )
+        self.assertNotIn("upx=True", source)
+
+    def test_version_generator_writes_distinct_descriptions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "packaging" / "generate_version_info.py"),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            gui = (output / "youziauth.version").read_text(encoding="utf-8")
+            agent = (output / "youziauth-agent.version").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("youziauth campus network tray and settings", gui)
+            self.assertIn(
+                "youziauth SYSTEM campus network authentication agent", agent
+            )
+            self.assertIn("1, 1, 4, 0", gui)
+            self.assertIn("1.1.4", agent)
 
 
 if __name__ == "__main__":

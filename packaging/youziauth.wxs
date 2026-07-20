@@ -2,7 +2,7 @@
   <Package
     Name="youziauth"
     Manufacturer="yoouzic"
-    Version="1.1.3"
+    Version="$(var.ProductVersion)"
     UpgradeCode="{D029E636-7E7E-42EE-8B38-C2D455AD2AA1}"
     Scope="perMachine">
 

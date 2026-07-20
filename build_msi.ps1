@@ -11,6 +11,10 @@ $BuildDir = Join-Path $Root "build"
 $WixBuildDir = Join-Path $BuildDir "wix"
 $DistDir = Join-Path $Root "dist"
 $MsiPath = Join-Path $DistDir "youziauth.msi"
+$Version = (Get-Content -LiteralPath (Join-Path $Root "VERSION") -Raw).Trim()
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "VERSION must use MAJOR.MINOR.PATCH"
+}
 
 function Resolve-Python {
     param([string]$RequestedPath)
@@ -62,7 +66,7 @@ function Resolve-Wix {
     }
 
     New-Item -ItemType Directory -Force -Path $toolPath | Out-Null
-    dotnet tool install wix --tool-path $toolPath | Out-Null
+    dotnet tool install wix --tool-path $toolPath --version 7.0.0 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to install WiX"
     }
@@ -79,6 +83,11 @@ $Wix = Resolve-Wix
 & $Python (Join-Path $PackagingDir "make_icons.py")
 if ($LASTEXITCODE -ne 0) {
     throw "Icon generation failed"
+}
+
+& $Python (Join-Path $PackagingDir "generate_version_info.py") --output (Join-Path $BuildDir "version")
+if ($LASTEXITCODE -ne 0) {
+    throw "Version resource generation failed"
 }
 
 & $Python -m PyInstaller --noconfirm --clean (Join-Path $PackagingDir "youziauth.spec")
@@ -104,6 +113,7 @@ if ($LASTEXITCODE -ne 0) {
 & $Wix --acceptEula wix7 build `
     (Join-Path $PackagingDir "youziauth.wxs") `
     $GeneratedWxs `
+    -d ProductVersion=$Version `
     -out $MsiPath
 if ($LASTEXITCODE -ne 0) {
     throw "WiX MSI build failed"
