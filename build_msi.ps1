@@ -11,6 +11,10 @@ $BuildDir = Join-Path $Root "build"
 $WixBuildDir = Join-Path $BuildDir "wix"
 $DistDir = Join-Path $Root "dist"
 $MsiPath = Join-Path $DistDir "youziauth.msi"
+$Version = (Get-Content -LiteralPath (Join-Path $Root "VERSION") -Raw).Trim()
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "VERSION must use MAJOR.MINOR.PATCH"
+}
 
 function Resolve-Python {
     param([string]$RequestedPath)
@@ -26,22 +30,18 @@ function Resolve-Python {
     throw "Python was not found. Install Python 3.10+ or pass -PythonPath C:\Path\To\python.exe"
 }
 
-function Ensure-PyInstaller {
+function Ensure-PythonBuildDependencies {
     param([string]$Python)
-    & $Python -m PyInstaller --version | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        return
+    $Requirements = Join-Path $Root "requirements-build.txt"
+    if ($InstallDependencies) {
+        & $Python -m pip install --requirement $Requirements
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install pinned Python build dependencies"
+        }
     }
-    if (-not $InstallDependencies) {
-        throw "PyInstaller is not installed. Re-run with -InstallDependencies or install it with: $Python -m pip install pyinstaller"
-    }
-    & $Python -m pip install pyinstaller
+    & $Python -c "import PIL, PyInstaller; assert PIL.__version__ == '12.2.0'; assert PyInstaller.__version__ == '6.16.0'"
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install PyInstaller"
-    }
-    & $Python -m PyInstaller --version | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "PyInstaller is still not available after installation"
+        throw "Pinned Python build dependencies are unavailable"
     }
 }
 
@@ -62,7 +62,7 @@ function Resolve-Wix {
     }
 
     New-Item -ItemType Directory -Force -Path $toolPath | Out-Null
-    dotnet tool install wix --tool-path $toolPath | Out-Null
+    dotnet tool install wix --tool-path $toolPath --version 7.0.0 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to install WiX"
     }
@@ -73,12 +73,17 @@ function Resolve-Wix {
 }
 
 $Python = Resolve-Python $PythonPath
-Ensure-PyInstaller $Python
+Ensure-PythonBuildDependencies $Python
 $Wix = Resolve-Wix
 
 & $Python (Join-Path $PackagingDir "make_icons.py")
 if ($LASTEXITCODE -ne 0) {
     throw "Icon generation failed"
+}
+
+& $Python (Join-Path $PackagingDir "generate_version_info.py") --output (Join-Path $BuildDir "version")
+if ($LASTEXITCODE -ne 0) {
+    throw "Version resource generation failed"
 }
 
 & $Python -m PyInstaller --noconfirm --clean (Join-Path $PackagingDir "youziauth.spec")
@@ -104,6 +109,7 @@ if ($LASTEXITCODE -ne 0) {
 & $Wix --acceptEula wix7 build `
     (Join-Path $PackagingDir "youziauth.wxs") `
     $GeneratedWxs `
+    -d ProductVersion=$Version `
     -out $MsiPath
 if ($LASTEXITCODE -ne 0) {
     throw "WiX MSI build failed"

@@ -56,6 +56,25 @@ make Tkinter look broken even when the same Python works normally.
 - Binary scans found no copy of the local password, password-file value, login URL, Windows user name, user-profile path, or Git commit email.
 - Git tracks none of the sensitive runtime files above, and the release commit contains no local password or login URL value.
 
+## 2026-07-19 Defender Incident Evidence
+
+- Microsoft Defender recorded `Trojan:Win32/Wacatac.C!ml` at `2026-07-19 13:47:26` and quarantined the installed `youziauth-agent.exe` together with the `\youziauth\SystemAgent` task.
+- The final agent runtime/log update before quarantine was `2026-07-19 13:47:17`, which explains both the stopped authentication checks and the frozen log view.
+- The installed agent and the locally built release agent matched at SHA-256 `F13D60574D1102494641C510C26FCBFBD5B762E2BB5188911A2BD3E86C4B0370`.
+- The affected 1.1.3 binary was unsigned. This is a reputation and provenance weakness, but is not by itself proof that the detection was correct or the only reason for it.
+- No broad Defender exclusion was added.
+- Recovery on `2026-07-20` re-registered the scheduled tasks through the elevated helper and ran the hidden SYSTEM task. One Agent process appeared, user-to-SYSTEM named-pipe status returned `ok: true / online_campus`, and the runtime snapshot reported `already authenticated` at `23:43:19+08:00`.
+- The log advanced from `23:43:49` to `23:44:22` over one configured check cycle, and the runtime snapshot advanced with it. The latest Defender record remained the original `2026-07-19 13:47` incident; no new youziauth detection appeared during this recovery check.
+- A post-fix reboot acceptance test has not yet been repeated.
+
+## 2026-07-20 Trusted Release Hardening Evidence
+
+- Local automated suite: 145 tests passed with zero failures after adding agent-health, immediate-repair, and release-policy coverage.
+- The local 1.1.4 pre-signing build completed with pinned Python 3.14.0, PyInstaller 6.16.0, Pillow 12.2.0, and WiX 7.0.0 inputs.
+- `youziauth.exe` and `youziauth-agent.exe` both report FileVersion and ProductVersion `1.1.4`; their file descriptions are distinct, and UPX is disabled.
+- The final locally rebuilt unsigned MSI is 15,410,208 bytes with SHA-256 `95C9756B5AB76268D765A0265C1BA0E3E7DEDD0505532520F535FBC385FB27B0`. WiX validation passed, while the release verifier rejected it with `MSI signature is NotSigned`, as required; it is not eligible for public release.
+- SignPath Foundation approval, the first signed workflow run, Microsoft submission verdicts, and clean-machine acceptance have not yet occurred and are not claimed here.
+
 ## 2026-07-19 System-Boot Pre-Release Evidence
 
 - Automated tests: 122 passed with zero failures (`python -m unittest discover -s tests -v`).

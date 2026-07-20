@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path.cwd()
+VERSION_DIR = ROOT / "build" / "version"
 
 datas = [
     (str(ROOT / "config.example.ini"), "."),
@@ -56,7 +57,7 @@ gui_exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -64,6 +65,7 @@ gui_exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "yuzu_app.ico"),
+    version=str(VERSION_DIR / "youziauth.version"),
 )
 
 agent_exe = EXE(
@@ -75,7 +77,7 @@ agent_exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -83,6 +85,7 @@ agent_exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ROOT / "assets" / "yuzu_app.ico"),
+    version=str(VERSION_DIR / "youziauth-agent.version"),
 )
 
 coll = COLLECT(
@@ -93,7 +96,7 @@ coll = COLLECT(
     agent_analysis.binaries,
     agent_analysis.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name="youziauth",
 )

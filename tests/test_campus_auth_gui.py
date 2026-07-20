@@ -1,10 +1,13 @@
 import configparser
+import datetime as dt
+import queue
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import campus_auth_gui
+import agent_health
 import agent_ipc
 import windows_tray
 from windows_credentials import CredentialStore
@@ -266,7 +269,7 @@ class StartupOptionTests(unittest.TestCase):
             self.assertEqual(spec.target_path, pythonw)
             self.assertIn("campus_auth_gui.py", spec.arguments)
             self.assertIn("--tray-startup", spec.arguments)
-            self.assertEqual(spec.working_directory, Path(temp_dir))
+            self.assertEqual(spec.working_directory, Path(temp_dir).resolve())
 
     def test_set_startup_enabled_false_removes_shortcut(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -488,15 +491,27 @@ class NotificationIntegrationTests(unittest.TestCase):
 
     def test_agent_poll_sends_tracker_toast_without_showing_window(self):
         app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.startup_enabled = True
         app.agent_mode = True
+        app.agent_ipc_ok = True
+        app.agent_startup_deadline = dt.datetime.now().astimezone()
         app.config_path = Path("C:/ProgramData/youziauth/config.ini")
+        app.interval_var = mock.Mock()
+        app.interval_var.get.return_value = "30"
         app.root = mock.Mock()
         app._set_status = mock.Mock()
         app._show_notification = mock.Mock()
+        app._update_agent_controls = mock.Mock()
+        app._start_agent_health_probe = mock.Mock()
         app.notification_tracker = mock.Mock()
         app.notification_tracker.evaluate.return_value = "<toast />"
         snapshot = agent_ipc.RuntimeSnapshot(
-            "boot", "auth_failed", False, "incident", "失败", "now"
+            "boot",
+            "auth_failed",
+            False,
+            "incident",
+            "失败",
+            dt.datetime.now().astimezone().isoformat(),
         )
 
         with mock.patch.object(
@@ -508,6 +523,86 @@ class NotificationIntegrationTests(unittest.TestCase):
         app.notification_tracker.evaluate.assert_called_once_with(snapshot)
         app._show_notification.assert_called_once_with("<toast />")
         app.root.deiconify.assert_not_called()
+
+
+class AgentHealthIntegrationTests(unittest.TestCase):
+    def make_app(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.startup_enabled = True
+        app.agent_mode = True
+        app.config_path = Path("C:/ProgramData/youziauth/config.ini")
+        app.agent_ipc_ok = False
+        app.agent_probe_in_flight = False
+        app.agent_last_probe_monotonic = 0.0
+        app.agent_startup_deadline = (
+            dt.datetime.now().astimezone() - dt.timedelta(seconds=1)
+        )
+        app.interval_var = mock.Mock()
+        app.interval_var.get.return_value = "30"
+        app.root = mock.Mock()
+        app._set_status = mock.Mock()
+        app._show_notification = mock.Mock()
+        app._update_agent_controls = mock.Mock()
+        app._start_agent_health_probe = mock.Mock()
+        app.notification_tracker = mock.Mock()
+        return app
+
+    def test_stale_snapshot_displays_degraded_instead_of_old_online_state(self):
+        app = self.make_app()
+        old = (dt.datetime.now().astimezone() - dt.timedelta(minutes=10)).isoformat()
+        stale = agent_ipc.RuntimeSnapshot(
+            "boot", "online_campus", detail="already authenticated", updated_at=old
+        )
+        with mock.patch.object(
+            campus_auth_gui.agent_ipc, "read_snapshot", return_value=stale
+        ):
+            app._poll_agent_status()
+        app._set_status.assert_called_with(
+            "系统认证代理状态已过期", windows_tray.TrayStatus.ERROR
+        )
+        app._update_agent_controls.assert_called_with(
+            agent_health.AgentHealthState.DEGRADED
+        )
+
+    def test_agent_probe_result_is_processed_without_blocking_tk_thread(self):
+        app = self.make_app()
+        app.events = queue.Queue()
+        app.events.put(("agent_probe", True))
+        app._process_events()
+        self.assertTrue(app.agent_ipc_ok)
+        self.assertFalse(app.agent_probe_in_flight)
+
+
+class AgentRepairTests(unittest.TestCase):
+    def test_degraded_agent_enables_repair_control(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.start_button = mock.Mock()
+        app._update_agent_controls(agent_health.AgentHealthState.DEGRADED)
+        app.start_button.configure.assert_called_with(
+            state="normal", text="修复系统代理"
+        )
+
+    def test_repair_re_registers_tasks_even_when_tray_marker_exists(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.agent_mode = True
+        app.agent_ipc_ok = False
+        app.agent_probe_in_flight = False
+        app._set_status = mock.Mock()
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks, "relaunch_elevated_configuration"
+        ) as elevate:
+            app.repair_system_agent()
+        elevate.assert_called_once_with(True)
+        self.assertIsNone(app.agent_ipc_ok)
+
+    def test_healthy_agent_start_does_not_claim_repair(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.agent_mode = True
+        app.agent_health_state = agent_health.AgentHealthState.HEALTHY
+        app._set_status = mock.Mock()
+        app._send_agent_command = mock.Mock()
+        self.assertTrue(app.start_monitor())
+        app._send_agent_command.assert_called_once_with("reload-config")
 
 
 class TrayStatusTests(unittest.TestCase):
