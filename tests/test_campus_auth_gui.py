@@ -269,7 +269,7 @@ class StartupOptionTests(unittest.TestCase):
             self.assertEqual(spec.target_path, pythonw)
             self.assertIn("campus_auth_gui.py", spec.arguments)
             self.assertIn("--tray-startup", spec.arguments)
-            self.assertEqual(spec.working_directory, Path(temp_dir))
+            self.assertEqual(spec.working_directory, Path(temp_dir).resolve())
 
     def test_set_startup_enabled_false_removes_shortcut(self):
         with tempfile.TemporaryDirectory() as temp_dir:
