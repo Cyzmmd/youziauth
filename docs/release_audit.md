@@ -64,6 +64,14 @@ make Tkinter look broken even when the same Python works normally.
 - The affected 1.1.3 binary was unsigned. This is a reputation and provenance weakness, but is not by itself proof that the detection was correct or the only reason for it.
 - No broad Defender exclusion was added. Recovery must allow only the verified detection, recreate the scheduled tasks through the elevated helper, and then verify the process, named pipe, fresh runtime snapshot, and fresh log output.
 
+## 2026-07-20 Trusted Release Hardening Evidence
+
+- Local automated suite: 144 tests passed with zero failures after adding agent-health and release-policy coverage.
+- The local 1.1.4 pre-signing build completed with pinned Python 3.14.0, PyInstaller 6.16.0, Pillow 12.2.0, and WiX 7.0.0 inputs.
+- `youziauth.exe` and `youziauth-agent.exe` both report FileVersion and ProductVersion `1.1.4`; their file descriptions are distinct, and UPX is disabled.
+- The locally built unsigned MSI is 15,402,016 bytes. The release verifier rejected it with `MSI signature is NotSigned`, as required; it is not eligible for public release.
+- SignPath Foundation approval, the first signed workflow run, Microsoft submission verdicts, and clean-machine acceptance have not yet occurred and are not claimed here.
+
 ## 2026-07-19 System-Boot Pre-Release Evidence
 
 - Automated tests: 122 passed with zero failures (`python -m unittest discover -s tests -v`).
