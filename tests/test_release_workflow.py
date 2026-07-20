@@ -26,6 +26,17 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("build_msi.ps1", text)
         self.assertIn("permissions:\n  contents: read", text)
 
+    def test_python_cache_uses_the_pinned_build_requirements(self):
+        for name in ("ci.yml", "release.yml"):
+            text = ROOT.joinpath(".github", "workflows", name).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "cache-dependency-path: requirements-build.txt",
+                text,
+                msg=name,
+            )
+
     def test_signpath_configuration_deep_signs_both_exes_and_msi(self):
         text = ROOT.joinpath(
             ".signpath", "artifact-configuration.xml"
