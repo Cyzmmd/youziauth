@@ -56,6 +56,14 @@ make Tkinter look broken even when the same Python works normally.
 - Binary scans found no copy of the local password, password-file value, login URL, Windows user name, user-profile path, or Git commit email.
 - Git tracks none of the sensitive runtime files above, and the release commit contains no local password or login URL value.
 
+## 2026-07-19 Defender Incident Evidence
+
+- Microsoft Defender recorded `Trojan:Win32/Wacatac.C!ml` at `2026-07-19 13:47:26` and quarantined the installed `youziauth-agent.exe` together with the `\youziauth\SystemAgent` task.
+- The final agent runtime/log update before quarantine was `2026-07-19 13:47:17`, which explains both the stopped authentication checks and the frozen log view.
+- The installed agent and the locally built release agent matched at SHA-256 `F13D60574D1102494641C510C26FCBFBD5B762E2BB5188911A2BD3E86C4B0370`.
+- The affected 1.1.3 binary was unsigned. This is a reputation and provenance weakness, but is not by itself proof that the detection was correct or the only reason for it.
+- No broad Defender exclusion was added. Recovery must allow only the verified detection, recreate the scheduled tasks through the elevated helper, and then verify the process, named pipe, fresh runtime snapshot, and fresh log output.
+
 ## 2026-07-19 System-Boot Pre-Release Evidence
 
 - Automated tests: 122 passed with zero failures (`python -m unittest discover -s tests -v`).
