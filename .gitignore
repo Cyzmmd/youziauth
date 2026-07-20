@@ -33,6 +33,7 @@ env/
 
 # Internal agent design and execution notes
 docs/superpowers/
+.worktrees/
 
 # Editor and operating-system files
 .idea/
