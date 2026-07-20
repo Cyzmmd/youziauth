@@ -72,7 +72,7 @@ make Tkinter look broken even when the same Python works normally.
 - Local automated suite: 145 tests passed with zero failures after adding agent-health, immediate-repair, and release-policy coverage.
 - The local 1.1.4 pre-signing build completed with pinned Python 3.14.0, PyInstaller 6.16.0, Pillow 12.2.0, and WiX 7.0.0 inputs.
 - `youziauth.exe` and `youziauth-agent.exe` both report FileVersion and ProductVersion `1.1.4`; their file descriptions are distinct, and UPX is disabled.
-- The locally built unsigned MSI is 15,402,016 bytes. The release verifier rejected it with `MSI signature is NotSigned`, as required; it is not eligible for public release.
+- The final locally rebuilt unsigned MSI is 15,410,208 bytes with SHA-256 `95C9756B5AB76268D765A0265C1BA0E3E7DEDD0505532520F535FBC385FB27B0`. WiX validation passed, while the release verifier rejected it with `MSI signature is NotSigned`, as required; it is not eligible for public release.
 - SignPath Foundation approval, the first signed workflow run, Microsoft submission verdicts, and clean-machine acceptance have not yet occurred and are not claimed here.
 
 ## 2026-07-19 System-Boot Pre-Release Evidence
