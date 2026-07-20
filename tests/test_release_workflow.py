@@ -26,6 +26,28 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("build_msi.ps1", text)
         self.assertIn("permissions:\n  contents: read", text)
 
+    def test_signpath_configuration_deep_signs_both_exes_and_msi(self):
+        text = ROOT.joinpath(
+            ".signpath", "artifact-configuration.xml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('<msi-file path="youziauth.msi"', text)
+        self.assertIn('<pe-file path="youziauth.exe"', text)
+        self.assertIn('<pe-file path="youziauth-agent.exe"', text)
+        self.assertEqual(text.count("<authenticode-sign"), 3)
+
+    def test_release_requires_signpath_and_never_publishes_unsigned_msi(self):
+        text = ROOT.joinpath(".github", "workflows", "release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "signpath/github-action-submit-signing-request@"
+            "b9d91eadd323de506c0c81cf0c7fe7438f3360fd",
+            text,
+        )
+        self.assertIn("packaging/verify_release.ps1", text)
+        self.assertIn("gh release create", text)
+        self.assertNotIn("dist/youziauth.msi ${{", text)
+
 
 if __name__ == "__main__":
     unittest.main()

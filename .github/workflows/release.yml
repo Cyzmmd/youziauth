@@ -1,0 +1,64 @@
+name: Signed Windows release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  build-sign-and-release:
+    runs-on: windows-latest
+    environment: signing
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install pinned build dependencies
+        run: python -m pip install --requirement requirements-build.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Verify tag matches VERSION
+        shell: powershell
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "tag/version mismatch"
+          }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build unsigned MSI
+        shell: powershell
+        run: .\build_msi.ps1 -InstallDependencies
+      - name: Upload unsigned MSI for SignPath
+        id: upload-unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: youziauth-unsigned-${{ github.sha }}
+          path: dist/youziauth.msi
+          if-no-files-found: error
+      - name: Submit SignPath request
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: youziauth
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-msi-deep-signing
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+          parameters: |
+            version: "${{ env.RELEASE_VERSION }}"
+      - name: Verify signed release
+        shell: powershell
+        run: ./packaging/verify_release.ps1 -MsiPath ./signed/youziauth.msi -Version $env:RELEASE_VERSION -OutputDirectory ./release
+      - name: Publish signed release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME .\signed\youziauth.msi .\release\SHA256SUMS.txt .\release\release-provenance.json --verify-tag --generate-notes
