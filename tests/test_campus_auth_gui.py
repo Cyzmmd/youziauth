@@ -573,6 +573,38 @@ class AgentHealthIntegrationTests(unittest.TestCase):
         self.assertFalse(app.agent_probe_in_flight)
 
 
+class AgentRepairTests(unittest.TestCase):
+    def test_degraded_agent_enables_repair_control(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.start_button = mock.Mock()
+        app._update_agent_controls(agent_health.AgentHealthState.DEGRADED)
+        app.start_button.configure.assert_called_with(
+            state="normal", text="修复系统代理"
+        )
+
+    def test_repair_re_registers_tasks_even_when_tray_marker_exists(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.agent_mode = True
+        app.agent_ipc_ok = False
+        app.agent_probe_in_flight = False
+        app._set_status = mock.Mock()
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks, "relaunch_elevated_configuration"
+        ) as elevate:
+            app.repair_system_agent()
+        elevate.assert_called_once_with(True)
+        self.assertIsNone(app.agent_ipc_ok)
+
+    def test_healthy_agent_start_does_not_claim_repair(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.agent_mode = True
+        app.agent_health_state = agent_health.AgentHealthState.HEALTHY
+        app._set_status = mock.Mock()
+        app._send_agent_command = mock.Mock()
+        self.assertTrue(app.start_monitor())
+        app._send_agent_command.assert_called_once_with("reload-config")
+
+
 class TrayStatusTests(unittest.TestCase):
     def test_tooltip_includes_current_online_status(self):
         tooltip = windows_tray.format_tray_tooltip(windows_tray.TrayStatus.ONLINE)

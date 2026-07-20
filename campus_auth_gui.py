@@ -684,6 +684,26 @@ class CampusAuthGui:
         else:
             self.start_button.configure(state="normal", text="开始后台检测")
 
+    def repair_system_agent(self) -> None:
+        try:
+            startup_tasks.relaunch_elevated_configuration(True)
+        except Exception as exc:  # noqa: BLE001 - report UAC/setup failures in the UI.
+            self._set_status(
+                f"修复系统代理失败：{exc}", windows_tray.TrayStatus.ERROR
+            )
+            return
+        self.agent_ipc_ok = None
+        self.agent_probe_in_flight = False
+        self.startup_enabled = True
+        self.agent_mode = True
+        self.agent_startup_deadline = (
+            dt.datetime.now().astimezone() + dt.timedelta(seconds=90)
+        )
+        self._set_status(
+            "已请求管理员修复，正在等待系统代理",
+            windows_tray.TrayStatus.CHECKING,
+        )
+
     def _show_notification(self, toast_xml: str) -> None:
         threading.Thread(
             target=windows_notifications.show_toast,
@@ -1003,8 +1023,14 @@ class CampusAuthGui:
 
     def start_monitor(self) -> bool:
         if self.agent_mode:
-            self._set_status("系统级后台认证已运行", windows_tray.TrayStatus.ONLINE)
-            self._send_agent_command("reload-config")
+            if self.agent_health_state is agent_health.AgentHealthState.DEGRADED:
+                self.repair_system_agent()
+            else:
+                self._set_status(
+                    "正在请求系统认证代理重新加载配置",
+                    windows_tray.TrayStatus.CHECKING,
+                )
+                self._send_agent_command("reload-config")
             return True
         if self.worker and self.worker.is_alive():
             return True
