@@ -62,11 +62,14 @@ make Tkinter look broken even when the same Python works normally.
 - The final agent runtime/log update before quarantine was `2026-07-19 13:47:17`, which explains both the stopped authentication checks and the frozen log view.
 - The installed agent and the locally built release agent matched at SHA-256 `F13D60574D1102494641C510C26FCBFBD5B762E2BB5188911A2BD3E86C4B0370`.
 - The affected 1.1.3 binary was unsigned. This is a reputation and provenance weakness, but is not by itself proof that the detection was correct or the only reason for it.
-- No broad Defender exclusion was added. Recovery must allow only the verified detection, recreate the scheduled tasks through the elevated helper, and then verify the process, named pipe, fresh runtime snapshot, and fresh log output.
+- No broad Defender exclusion was added.
+- Recovery on `2026-07-20` re-registered the scheduled tasks through the elevated helper and ran the hidden SYSTEM task. One Agent process appeared, user-to-SYSTEM named-pipe status returned `ok: true / online_campus`, and the runtime snapshot reported `already authenticated` at `23:43:19+08:00`.
+- The log advanced from `23:43:49` to `23:44:22` over one configured check cycle, and the runtime snapshot advanced with it. The latest Defender record remained the original `2026-07-19 13:47` incident; no new youziauth detection appeared during this recovery check.
+- A post-fix reboot acceptance test has not yet been repeated.
 
 ## 2026-07-20 Trusted Release Hardening Evidence
 
-- Local automated suite: 144 tests passed with zero failures after adding agent-health and release-policy coverage.
+- Local automated suite: 145 tests passed with zero failures after adding agent-health, immediate-repair, and release-policy coverage.
 - The local 1.1.4 pre-signing build completed with pinned Python 3.14.0, PyInstaller 6.16.0, Pillow 12.2.0, and WiX 7.0.0 inputs.
 - `youziauth.exe` and `youziauth-agent.exe` both report FileVersion and ProductVersion `1.1.4`; their file descriptions are distinct, and UPX is disabled.
 - The locally built unsigned MSI is 15,402,016 bytes. The release verifier rejected it with `MSI signature is NotSigned`, as required; it is not eligible for public release.
