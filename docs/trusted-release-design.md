@@ -69,11 +69,10 @@ Microsoft Defender 在 2026-07-19 13:47 将 `youziauth-agent.exe`、正在运行
 2. 安装锁定版本的 Python、PyInstaller、WiX 和项目依赖。
 3. 运行全部单元测试、Python 编译检查、许可证检查和敏感信息扫描。
 4. 生成带版本资源的两个 EXE，并构建未签名 MSI。
-5. 将待签名文件及构建来源提交给 SignPath；SignPath 在 HSM 中完成 Authenticode 签名和 RFC 3161 时间戳。
-6. 下载签名后的 EXE，重新生成包含已签名文件的 MSI，再对最终 MSI 签名并加时间戳。
-7. 使用 `Get-AuthenticodeSignature` 或 `signtool verify /pa /all` 验证三个签名，任何一个不是有效签名都阻止发布。
-8. 生成 SHA-256 清单、构建信息和 Git 提交信息。
-9. 只有测试、签名验证和发布物审计全部通过后，才允许创建 GitHub Release。
+5. 将未签名 MSI 及 GitHub 构建来源提交给 SignPath；SignPath 按受审计的 artifact configuration 先签署 MSI 内的两个 EXE，再重新封装并签署 MSI，同时添加 RFC 3161 时间戳。
+6. 下载深度签名后的 MSI，通过管理安装提取两个 EXE，验证 MSI 和两个 EXE 的签名、时间戳及版本元数据；任何一项无效都阻止发布。
+7. 生成 SHA-256 清单、构建信息和 Git 提交信息。
+8. 只有测试、签名验证和发布物审计全部通过后，才允许创建 GitHub Release。
 
 SignPath 组织、项目和签名策略标识通过 GitHub repository variables 配置。SignPath Foundation 尚未批准项目前，工作流允许执行测试和未签名构建审计，但签名门未通过时必须停止，不能发布正式 Release。
 
@@ -131,7 +130,7 @@ SignPath 组织、项目和签名策略标识通过 GitHub repository variables 
 - Python 编译检查通过。
 - PyInstaller 输出包含两个带正确版本元数据的 EXE。
 - WiX 校验通过，MSI 不包含任何运行时敏感文件。
-- 三个发布物的 Authenticode 状态均为 `Valid`，签名者和时间戳符合 SignPath 策略。
+- 最终 MSI 及其内部两个 EXE 的 Authenticode 状态均为 `Valid`，签名者和时间戳符合 SignPath 策略。
 
 ### 干净机验收
 
