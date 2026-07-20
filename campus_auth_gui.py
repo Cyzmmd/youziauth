@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import configparser
 import dataclasses
+import datetime as dt
 import logging
 import os
 import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-import campus_auth
+import agent_health
 import agent_ipc
+import campus_auth
 import startup_tasks
 import windows_notifications
 import windows_tray
@@ -531,7 +534,7 @@ class CampusAuthGui:
 
         self.root = root
         self.config_path = ensure_user_config(config_path)
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
         self.tray_icon: Optional[windows_tray.WindowsTrayIcon] = None
@@ -540,6 +543,18 @@ class CampusAuthGui:
         self.startup_mode = tray_startup
         self.tray_startup = tray_startup
         self.agent_mode = is_startup_enabled()
+        self.startup_enabled = self.agent_mode
+        self.agent_ipc_ok: bool | None = None
+        self.agent_probe_in_flight = False
+        self.agent_last_probe_monotonic = 0.0
+        self.agent_startup_deadline = (
+            dt.datetime.now().astimezone() + dt.timedelta(seconds=90)
+        )
+        self.agent_health_state = (
+            agent_health.AgentHealthState.STARTING
+            if self.agent_mode
+            else agent_health.AgentHealthState.DISABLED
+        )
         self.notification_tracker = windows_notifications.NotificationTracker()
         self.last_agent_snapshot: agent_ipc.RuntimeSnapshot | None = None
         self.status_dot = None
@@ -594,26 +609,80 @@ class CampusAuthGui:
         self.events.put(("ui_action", command.command))
         return {"ok": True}
 
+    def _start_agent_health_probe(self) -> None:
+        now = time.monotonic()
+        if self.agent_probe_in_flight or now - self.agent_last_probe_monotonic < 5:
+            return
+        self.agent_probe_in_flight = True
+        self.agent_last_probe_monotonic = now
+
+        def worker() -> None:
+            ok = False
+            try:
+                response = agent_ipc.send_command(
+                    "youziauth-agent",
+                    agent_ipc.AgentCommand("status"),
+                    timeout_ms=1000,
+                )
+                ok = response.get("ok") is True
+            except (OSError, TimeoutError, ValueError):
+                pass
+            self.events.put(("agent_probe", ok))
+
+        threading.Thread(
+            target=worker,
+            name="youziauth-agent-health",
+            daemon=True,
+        ).start()
+
     def _poll_agent_status(self) -> None:
         if self.agent_mode:
+            snapshot = None
             try:
-                snapshot = agent_ipc.read_snapshot(self.config_path.parent / "runtime.json")
+                snapshot = agent_ipc.read_snapshot(
+                    self.config_path.parent / "runtime.json"
+                )
             except (OSError, ValueError):
-                self._set_status("等待系统认证代理...", windows_tray.TrayStatus.CHECKING)
-            else:
-                self.last_agent_snapshot = snapshot
-                status = {
-                    "online_external": windows_tray.TrayStatus.ONLINE,
-                    "online_campus": windows_tray.TrayStatus.ONLINE,
-                    "waiting_for_network": windows_tray.TrayStatus.CHECKING,
-                    "auth_failed": windows_tray.TrayStatus.OFFLINE,
-                    "error": windows_tray.TrayStatus.ERROR,
-                }.get(snapshot.state, windows_tray.TrayStatus.ERROR)
-                self._set_status(snapshot.detail or snapshot.state, status)
-                toast_xml = self.notification_tracker.evaluate(snapshot)
+                pass
+            self._start_agent_health_probe()
+            try:
+                interval = campus_auth.parse_positive_int(
+                    self.interval_var.get(), "check_interval_seconds"
+                )
+            except ValueError:
+                interval = 60
+            health = agent_health.evaluate_agent_health(
+                startup_enabled=self.startup_enabled,
+                snapshot=snapshot,
+                ipc_ok=self.agent_ipc_ok,
+                check_interval_seconds=interval,
+                now=dt.datetime.now().astimezone(),
+                startup_deadline=self.agent_startup_deadline,
+            )
+            self.agent_health_state = health.state
+            status = {
+                agent_health.AgentHealthState.STARTING: windows_tray.TrayStatus.CHECKING,
+                agent_health.AgentHealthState.HEALTHY: windows_tray.TrayStatus.ONLINE,
+                agent_health.AgentHealthState.DEGRADED: windows_tray.TrayStatus.ERROR,
+            }[health.state]
+            self._set_status(health.detail, status)
+            self._update_agent_controls(health.state)
+            if health.state is agent_health.AgentHealthState.HEALTHY and health.snapshot:
+                self.last_agent_snapshot = health.snapshot
+                toast_xml = self.notification_tracker.evaluate(health.snapshot)
                 if toast_xml:
                     self._show_notification(toast_xml)
         self.root.after(1000, self._poll_agent_status)
+
+    def _update_agent_controls(self, state: agent_health.AgentHealthState) -> None:
+        if state is agent_health.AgentHealthState.DEGRADED:
+            self.start_button.configure(state="normal", text="修复系统代理")
+        elif state is agent_health.AgentHealthState.HEALTHY:
+            self.start_button.configure(state="disabled", text="系统代理运行中")
+        elif state is agent_health.AgentHealthState.STARTING:
+            self.start_button.configure(state="disabled", text="等待系统代理")
+        else:
+            self.start_button.configure(state="normal", text="开始后台检测")
 
     def _show_notification(self, toast_xml: str) -> None:
         threading.Thread(
@@ -898,6 +967,8 @@ class CampusAuthGui:
             current_startup = is_startup_enabled()
             if requested_startup != current_startup:
                 set_startup_enabled(requested_startup)
+            self.startup_enabled = requested_startup
+            self.agent_mode = requested_startup
             if self.agent_mode:
                 self._send_agent_command("reload-config")
         except Exception as exc:  # noqa: BLE001 - GUI should report validation errors.
@@ -1033,6 +1104,9 @@ class CampusAuthGui:
                 self._handle_tray_command(str(value))
             elif kind == "ui_action":
                 self._handle_ui_action(str(value))
+            elif kind == "agent_probe":
+                self.agent_ipc_ok = bool(value)
+                self.agent_probe_in_flight = False
         self.root.after(250, self._process_events)
 
     def _auto_refresh_log(self) -> None:
