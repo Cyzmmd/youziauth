@@ -72,8 +72,27 @@ function Resolve-Wix {
     return $localWix
 }
 
+function Ensure-DormDependencies {
+    param([string]$Python)
+    if ($InstallDependencies) {
+        & $Python -m pip install -r (Join-Path $Root "requirements-dorm.txt")
+        if ($LASTEXITCODE -ne 0) { throw "Failed to install dorm login dependencies" }
+    }
+    & $Python -c "from playwright.sync_api import sync_playwright; from winrt.windows.devices.geolocation import Geolocator"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Dorm login/location dependencies are required. Re-run with -InstallDependencies."
+    }
+}
+
 $Python = Resolve-Python $PythonPath
 Ensure-PyInstaller $Python
+Ensure-DormDependencies $Python
+if ($InstallDependencies) {
+    & $Python -m pip install -r (Join-Path $Root "requirements-desktop.txt")
+    if ($LASTEXITCODE -ne 0) { throw "Failed to install desktop UI dependencies" }
+}
+& $Python -c "import webview; import clr"
+if ($LASTEXITCODE -ne 0) { throw "Desktop dependencies missing. Re-run with -InstallDependencies." }
 $Wix = Resolve-Wix
 
 & $Python (Join-Path $PackagingDir "make_icons.py")

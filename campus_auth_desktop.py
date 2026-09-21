@@ -1,0 +1,274 @@
+"""Unified WebView2 desktop entry and isolated, synthetic browser preview."""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import queue
+import sys
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+import agent_ipc
+import campus_auth_gui as gui
+import windows_tray
+from desktop_bridge import DesktopBridge, PreviewBridge
+
+
+def set_desktop_app_id():
+    """Group source and packaged windows under the installed app identity on Windows."""
+    try:
+        function = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        function.argtypes = [ctypes.c_wchar_p]
+        function.restype = ctypes.c_long
+        return function('youziauth') == 0
+    except (AttributeError, OSError):
+        return False
+
+
+class DesktopRuntime:
+    def __init__(self, bridge, window, preview=False):
+        self.bridge, self.window, self.preview = bridge, window, preview
+        self.events = queue.Queue()
+        self.closed = threading.Event()
+        self.exiting = False
+        self.tray = None
+        self.bridge._window_action = self.events.put
+        self.bridge._ui_dispatch = self._on_ui
+
+    def _on_ui(self, callback):
+        """RequestAccessAsync must originate on the foreground WinForms UI thread."""
+        from System import Action
+        done = threading.Event()
+        result = {}
+        def invoke():
+            try:
+                self.window.native.Activate()
+                result['value'] = callback()
+            except Exception as exc:
+                result['error'] = exc
+            finally:
+                done.set()
+        self.window.native.BeginInvoke(Action(invoke))
+        if not done.wait(10):
+            raise TimeoutError('UI permission request did not start')
+        if 'error' in result:
+            raise result['error']
+        return result['value']
+
+    def closing(self):
+        if self.exiting:
+            return True
+        self.events.put('hide')
+        return False
+
+    def _show(self, page='overview'):
+        self.window.show()
+        self.window.restore()
+        self.window.evaluate_js('window.desktopNavigate(' + json.dumps(page) + ')')
+
+    def _handle(self, action):
+        if action == 'quit':
+            self.exiting = True
+            self.bridge._close()
+            if self.tray:
+                self.tray.stop()
+                self.tray = None
+            self.closed.set()
+            self.window.destroy()
+        elif action == 'hide':
+            if self.tray:
+                self.window.hide()
+            else:
+                self.window.minimize()
+        elif action in ('show', 'settings', 'dorm'):
+            self._show({'settings':'network','dorm':'dorm'}.get(action,'overview'))
+        elif action in ('check', 'retry'):
+            if action == 'retry' and not self.preview:
+                self.bridge._notification_tracker.mark_retry(self.bridge._last_agent)
+            result = self.bridge.dispatch('network_check')
+            if not result['ok']:
+                self._show('network')
+        elif action == 'suppress' and not self.preview:
+            self.bridge._agent_command('suppress-notifications-for-boot')
+
+    def _ipc(self):
+        def receive(command):
+            self.events.put(command.command)
+            return {'ok': True}
+        server = agent_ipc.NamedPipeServer(gui.UI_PIPE_NAME, receive, command_parser=agent_ipc.UiCommand.parse)
+        while not self.closed.is_set():
+            try:
+                server.serve_once()
+            except Exception:
+                self.closed.wait(1)
+
+    def run(self, startup=False, secondary=None):
+        self.window.events.loaded.wait()
+        if not startup:
+            self.window.show()
+            self.window.restore()
+        tray = windows_tray.WindowsTrayIcon(
+            on_command=self.events.put, status=windows_tray.TrayStatus.STOPPED,
+            detail='演示预览' if self.preview else '就绪',
+            icon_paths=windows_tray.default_icon_paths(gui.resource_path('assets')),
+        )
+        if tray.start():
+            self.tray = tray
+        elif startup:
+            self.window.show()
+            self.window.minimize()
+        if not self.preview:
+            threading.Thread(target=self._ipc, daemon=True, name='youziauth-desktop-ipc').start()
+            if startup and not self.bridge._agent:
+                self.bridge.dispatch('network_start')
+        if secondary:
+            self.events.put(secondary)
+        while not self.closed.is_set():
+            try:
+                action = self.events.get(timeout=1)
+                self._handle(action)
+            except queue.Empty:
+                pass
+            except Exception:
+                # A failed tray/IPC action must not stop background scheduling.
+                if not self.preview:
+                    self.bridge._state, self.bridge._message = 'error', '操作未完成，请打开设置检查'
+            if self.closed.is_set():
+                break
+            try:
+                self.bridge._tick()
+                if self.tray:
+                    if self.preview:
+                        n = self.bridge.snapshot()['network']
+                        status, message = n['state'], '演示预览 · ' + n['message']
+                    else:
+                        status, message = self.bridge._state, self.bridge._message
+                    self.tray.update(windows_tray.TrayStatus(status), message)
+            except Exception:
+                if not self.preview:
+                    self.bridge._state, self.bridge._message = 'error', '后台状态读取失败，请检查配置'
+
+
+def preview_server(port):
+    """Serve only bundled UI and in-memory demo data. Never instantiate DesktopBridge."""
+    bridge = PreviewBridge()
+    lock = threading.Lock()
+
+    class Handler(SimpleHTTPRequestHandler):
+        def _json(self, value, status=200):
+            data = json.dumps(value, ensure_ascii=False).encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == '/api/state':
+                with lock:
+                    return self._json(bridge.snapshot())
+            return super().do_GET()
+
+        def do_POST(self):
+            if self.path != '/api/action':
+                return self._json({'ok':False},404)
+            origin = self.headers.get('Origin')
+            expected = f'http://127.0.0.1:{self.server.server_port}'
+            if origin and origin != expected:
+                return self._json({'ok':False},403)
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 16000:
+                    raise ValueError()
+                data = json.loads(self.rfile.read(length))
+                with lock:
+                    self._json(bridge.dispatch(data['action'],data.get('payload')))
+            except (ValueError, KeyError, TypeError):
+                self._json({'ok':False,'message':'无效的预览请求'},400)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1',port),partial(Handler,directory=str(gui.resource_path('desktop_ui'))))
+    print(f'Isolated preview: http://127.0.0.1:{server.server_port}/?preview=1',flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) == 2 and argv[0] == '--location-self-test':
+        # Explicit diagnostic: real local positioning only; no controller/school API.
+        from pathlib import Path
+        from dorm_location import probe_location
+        result = probe_location()
+        output = Path(argv[1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        return 0 if result['state'] == 'ready' else 2
+    if '--preview-server' in argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--preview-server',action='store_true')
+        parser.add_argument('--port',type=int,default=8766)
+        args = parser.parse_args(argv)
+        preview_server(args.port)
+        return 0
+    location_diagnostic = '--location-diagnostic' in argv
+    preview = '--preview' in argv or location_diagnostic
+    set_desktop_app_id()
+    # Keep Windows task/toast activation and elevated helper CLI compatibility.
+    for argument in argv:
+        if argument.startswith('--configure-system-startup='):
+            return gui._run_elevated_startup_configuration(argument.split('=',1)[1])
+    if len(argv)==2 and argv[0] in ('--dorm-self-test','--dorm-login-probe'):
+        from dorm_selftest import run
+        return run(argv[1], online_login=argv[0]=='--dorm-login-probe')
+    try:
+        import webview
+    except ImportError:
+        raise RuntimeError('缺少桌面组件。请先运行 python -m pip install -r requirements-desktop.txt') from None
+    startup = gui.TRAY_STARTUP_ARGUMENT in argv or gui.LEGACY_STARTUP_ARGUMENT in argv
+    secondary = gui.resolve_secondary_action(argv)
+    hidden = gui.should_start_hidden(startup, secondary)
+    instance = None
+    if not preview:
+        instance = gui.SingleInstanceLock()
+        code = gui.handle_single_instance_startup(startup,instance,secondary_action=secondary)
+        if code is not None:
+            return code
+    bridge = None
+    runtime = None
+    try:
+        bridge = PreviewBridge(real_location=location_diagnostic) if preview else DesktopBridge(startup_mode=startup)
+        screen = webview.screens[0]
+        window = webview.create_window(
+            'youziauth · 校园日常' + (' · 定位诊断' if location_diagnostic else ' · 演示预览' if preview else ''),
+            url=str(gui.resource_path('desktop_ui/index.html')), js_api=bridge,
+            width=min(1160, screen.width - 60),height=min(820, screen.height - 100),
+            min_size=(min(820, screen.width - 60), min(620, screen.height - 100)),hidden=hidden,
+            background_color='#f4f2ec',text_select=True,
+        )
+        runtime = DesktopRuntime(bridge,window,preview)
+        window.events.closing += runtime.closing
+        window.events.closed += runtime.closed.set
+        webview.start(runtime.run,(hidden,secondary),gui='edgechromium',
+                      icon=str(gui.resource_path('assets/yuzu_app.ico')))
+        return 0
+    finally:
+        if runtime:
+            runtime.closed.set()
+            if runtime.tray:
+                runtime.tray.stop()
+        if bridge:
+            bridge._close()
+        if instance:
+            instance.release()
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

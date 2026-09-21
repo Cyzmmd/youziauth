@@ -41,6 +41,7 @@ COMMAND_IDS = {
     1002: "settings",
     1003: "check",
     1004: "quit",
+    1005: "dorm",
 }
 
 
@@ -66,6 +67,7 @@ def build_tray_menu_items(status: TrayStatus) -> tuple[TrayMenuItem, ...]:
         TrayMenuItem(label="显示主界面", command="show"),
         TrayMenuItem(label="进入设置", command="settings"),
         TrayMenuItem(label="立即检测", command="check"),
+        TrayMenuItem(label="寝室打卡", command="dorm"),
         TrayMenuItem(separator=True),
         TrayMenuItem(label="退出", command="quit"),
     )

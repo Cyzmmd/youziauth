@@ -98,7 +98,7 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("ProgramMenuFolder", source)
         self.assertIn("Shortcut", source)
         self.assertIn("youziauth.exe", source)
-        self.assertIn('Version="1.1.3"', source)
+        self.assertIn('Version="1.3.1"', source)
         self.assertIn("System.AppUserModel.ID", source)
         self.assertIn('Value="youziauth"', source)
         self.assertNotIn("Campus Network Auth", source)

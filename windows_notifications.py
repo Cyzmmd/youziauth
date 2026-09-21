@@ -87,6 +87,10 @@ def build_result_toast(success: bool, detail: str) -> str:
     return _build_toast("校园网认证成功" if success else "校园网认证仍未成功", detail)
 
 
+def build_dorm_toast(detail: str) -> str:
+    return _build_toast("寝室打卡", detail)
+
+
 def should_show_failure(snapshot: RuntimeSnapshot, last_incident_id: str) -> bool:
     return bool(
         snapshot.state == "auth_failed"

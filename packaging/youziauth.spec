@@ -8,6 +8,7 @@ ROOT = Path.cwd()
 datas = [
     (str(ROOT / "config.example.ini"), "."),
     (str(ROOT / "assets"), "assets"),
+    (str(ROOT / "desktop_ui"), "desktop_ui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(ROOT / "third_party_licenses"), "third_party_licenses"),
 ]
@@ -17,7 +18,9 @@ gui_analysis = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=["playwright.sync_api", "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
+                   "winrt.runtime", "winrt.windows.foundation", "winrt.windows.devices.geolocation",
+                   "winrt._winrt", "winrt._winrt_windows_foundation", "winrt._winrt_windows_devices_geolocation"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
