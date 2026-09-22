@@ -1,6 +1,7 @@
 """Independent dormitory UI and worker lifecycle; no network-agent commands."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import os
 import queue
@@ -17,13 +18,16 @@ class DormController:
     def __init__(self, store=None, engine=None):
         self.store = store or Store()
         self.api = SwuApi()
-        self.engine = engine or Engine(self.store, self.api, locate)
+        self.engine = engine or Engine(self.store, self.api, self._locate)
         self.events = queue.Queue()
         self.busy = False
         self.closed = False
         self._gate = threading.Lock()
         self._poll_at = 0.0
         self.latest = Result('idle', '尚未查询今日任务')
+
+    def _locate(self):
+        return locate(self.store.settings().location_source, self.store.root / 'location-sample.json')
 
     def start(self, action):
         if action not in ('query', 'submit', 'login', 'logout', 'automatic'):
@@ -41,7 +45,7 @@ class DormController:
                     result = Result('logged_in', '登录成功，凭据已在本机加密保存')
                 elif action == 'logout':
                     settings = self.store.settings()
-                    self.store.save_settings(Settings(False, settings.start, settings.end, settings.interval))
+                    self.store.save_settings(dataclasses.replace(settings, enabled=False))
                     self.store.clear_token()
                     result = Result('login_required', '登录凭据已清除，自动打卡已关闭')
                 elif action == 'automatic':
@@ -85,9 +89,12 @@ class DormController:
                 return values
 
     def save(self, settings):
-        self.store.save_settings(settings)
-        self.engine.next_tick = 0
-        self._poll_at = 0
+        with self._gate:
+            if self.closed or self.busy:
+                raise RuntimeError('请等待当前打卡操作完成后再保存设置。')
+            self.store.save_settings(settings)
+            self.engine.next_tick = 0
+            self._poll_at = 0
 
     def cancel(self):
         self.engine.cancel.set()
@@ -167,7 +174,8 @@ class DormPanel:
         ttk.Label(options, text='间隔（秒）').grid(row=2, column=0, sticky='w')
         ttk.Entry(options, width=8, textvariable=self.interval).grid(row=2, column=1, padx=5)
         ttk.Button(options, text='保存打卡设置', command=self.save).grid(row=2, column=3, padx=5)
-        ttk.Label(frame, text='自动执行需电脑开机、登录 Windows，并保持本软件运行。实际提交还须在学校任务时段内。\n每次使用 Windows 实时定位；位置不可用或精度不足时停止。登录失效时需手动重新登录。',
+        self.location_text = tk.StringVar()
+        ttk.Label(frame, textvariable=self.location_text,
                   wraplength=620, justify='left').grid(row=7, sticky='w', pady=(0, 10))
         self.history = tk.Text(frame, height=7, wrap='word', state='disabled', font=('Microsoft YaHei UI', 9))
         self.history.grid(row=8, sticky='nsew')
@@ -194,11 +202,19 @@ class DormPanel:
     def save(self):
         from tkinter import messagebox
         try:
-            settings = Settings(self.enabled.get(), self.start.get().strip(), self.end.get().strip(), int(self.interval.get()))
+            try:
+                previous = self.controller.store.settings()
+            except (ValueError, TypeError, OSError):
+                previous = Settings()
+            settings = dataclasses.replace(previous, enabled=self.enabled.get(),
+                                           start=self.start.get().strip(), end=self.end.get().strip(),
+                                           interval=int(self.interval.get()))
             self.controller.save(settings)
             self.state.set('打卡设置已保存')
         except (ValueError, OSError):
             messagebox.showerror('无法保存', '请填写正确时段和 60–3600 秒间隔，并确认目录可写。', parent=self.window)
+        except RuntimeError as exc:
+            messagebox.showerror('无法保存', str(exc), parent=self.window)
         self.refresh()
 
     def act(self, action):
@@ -225,6 +241,14 @@ class DormPanel:
 
     def refresh(self):
         self.schedule.set(self.controller.schedule_text())
+        try:
+            source = self.controller.store.settings().location_source
+            description = ('模拟定位（本机样本随机偏移，非实时，并非当前位置）' if source == 'simulation' else
+                           'Windows 实时定位（由系统选择来源）')
+            self.location_text.set(f'全局定位来源：{description}。检测和提交均沿用此选择，仍须通过学校范围校验。\n'
+                                   '自动执行需电脑开机、登录 Windows，并保持软件运行；位置不可用或精度不足时停止。')
+        except (ValueError, TypeError, OSError):
+            self.location_text.set('定位来源配置不可用，请在主界面重新保存设置。')
         for button in self.buttons:
             button.configure(state='disabled' if self.controller.busy else 'normal')
         try:

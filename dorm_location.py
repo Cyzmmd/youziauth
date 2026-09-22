@@ -2,12 +2,18 @@
 
 Windows produces WGS84. The mobile form uses offset map coordinates (GCJ02).
 Conversion is approximate; the school verify endpoint remains authoritative.
+
+A replayed sample is reported like a fresh fix: same provider, same fields, and a small bounded
+drift, because identical coordinates repeated night after night are easy to spot in history.
 """
 import asyncio
 import datetime as dt
+import json
 import math
 import os
+import random
 import time
+from pathlib import Path
 
 from dorm_checkin import CheckinError
 
@@ -25,7 +31,28 @@ MESSAGES = {
     'invalid': 'Windows 返回的定位数据无效，未提交；请重新检测。',
     'component_missing': '定位组件缺失，请安装完整新版程序后重试。',
     'error': 'Windows 定位接口调用失败，请重新打开程序后检测；这不一定是权限未开启。',
+    'sample_missing': '本机尚未保存模拟定位样本，请先准备样本或切换为真实定位。',
+    'sample_invalid': '模拟定位样本无法读取或数据无效，请检查本地样本或切换为真实定位。',
 }
+
+
+ACCURACY_LIMIT_M = 200.0
+
+# School-facing label for every accepted position. A replayed sample must not be distinguishable
+# from a live Windows fix, so both sources report this same value inside mapData / qddz; the active
+# source is tracked locally in Settings.location_source and never leaves the machine.
+POSITION_PROVIDER = 'windows'
+
+# A live fix never repeats itself exactly, so a replayed one must not either: identical numbers
+# every night are a stronger fingerprint than any payload field. Drift stays well inside the
+# school's own range check (the task radius is hundreds of metres), and the accuracy spread never
+# pushes the value across the acceptance limit.
+DRIFT_RATIO = 0.2        # drift radius as a fraction of the sample's stated accuracy
+DRIFT_FLOOR_M = 3.0      # metres; keeps a precise sample from looking pinned
+DRIFT_CAP_M = 25.0       # metres; never wander far enough to threaten the range check
+ACCURACY_SPREAD = 0.15   # ±15 % on the reported accuracy
+
+_RNG = random.Random()
 
 
 class LocationFailure(CheckinError):
@@ -63,14 +90,14 @@ def validate_position(data):
         raise LocationFailure('invalid') from None
     if data.get('source') in ('DEFAULT', 'IP_ADDRESS', 'OBFUSCATED'):
         raise LocationFailure('default_position')
-    if accuracy > 200:
+    if accuracy > ACCURACY_LIMIT_M:
         raise LocationFailure('inaccurate')
     if not -10 <= time.time()-stamp <= 120:
         raise LocationFailure('stale')
     lat, lng = wgs84_to_gcj02(lat, lng)
     return {'latitude': lat, 'longitude': lng, 'accuracy': accuracy, 'time': int(stamp*1000),
             'address': '', 'province': '', 'city': '', 'district': '', 'road': '',
-            'provider': 'windows', 'isOffset': True, 'errorCode': 0, 'errorMessage': ''}
+            'provider': POSITION_PROVIDER, 'isOffset': True, 'errorCode': 0, 'errorMessage': ''}
 
 
 def _winrt_modules():
@@ -142,20 +169,78 @@ def read_position():
         runtime.uninit_apartment()
 
 
-def locate():
-    return validate_position(read_position())
+def _drift_point(lat, lng, accuracy, rng):
+    """Move a replayed fix the way a fresh one would differ, by a bounded random offset."""
+    radius = min(DRIFT_CAP_M, max(DRIFT_FLOOR_M, accuracy * DRIFT_RATIO))
+    distance = radius * math.sqrt(rng.random())          # uniform over the disc, not the edge
+    bearing = rng.uniform(0, 2 * math.pi)
+    metres_per_degree = 111_320.0
+    north = distance * math.cos(bearing) / metres_per_degree
+    east = distance * math.sin(bearing) / (metres_per_degree * max(0.01, math.cos(math.radians(lat))))
+    return lat + north, lng + east
 
 
-def probe_location(ui_dispatch=None):
+def _drift_accuracy(accuracy, rng):
+    """Vary the reported accuracy without ever crossing the acceptance limit."""
+    high = min(accuracy * (1 + ACCURACY_SPREAD), ACCURACY_LIMIT_M * 0.99)
+    low = min(accuracy * (1 - ACCURACY_SPREAD), high)
+    return rng.uniform(low, high)
+
+
+def simulate_location(sample, *, latitude=None, longitude=None, accuracy=None, timestamp=None, rng=None):
+    if not isinstance(sample, dict):
+        raise ValueError('定位样本必须是 JSON 对象')
+    if not math.isfinite(float(sample['timestamp'])) or not isinstance(sample.get('source'), str):
+        raise ValueError('定位样本缺少有效采样信息')
+    raw = dict(sample)
+    for key, value in (('latitude', latitude), ('longitude', longitude), ('accuracy', accuracy)):
+        if value is not None:
+            raw[key] = value
+    # Replay clock is simulated; it does not indicate a fresh Windows fix.
+    raw['timestamp'] = time.time() if timestamp is None else timestamp
+    # validate_position stamps the same provider a live fix carries, so the sample stays
+    # indistinguishable in the submission; only the local source setting records the choice.
+    position = validate_position(raw)
+    # Drift only what the caller did not pin down, so an explicit --latitude/--longitude/--accuracy
+    # request still reproduces one exact point. The school gates the drifted values like any other.
+    jitter = rng or _RNG
+    if latitude is None and longitude is None:
+        position['latitude'], position['longitude'] = _drift_point(
+            position['latitude'], position['longitude'], position['accuracy'], jitter)
+    if accuracy is None:
+        position['accuracy'] = _drift_accuracy(position['accuracy'], jitter)
+    return position
+
+
+def locate(source='windows', sample_path=None):
+    if source == 'windows':
+        return validate_position(read_position())
+    if source != 'simulation':
+        raise CheckinError('location_required', '定位来源无效，请重新保存设置。')
+    if sample_path is None:
+        raise LocationFailure('sample_missing')
+    try:
+        sample = json.loads(Path(sample_path).read_text(encoding='utf-8'))
+        return simulate_location(sample)
+    except FileNotFoundError:
+        raise LocationFailure('sample_missing') from None
+    except (LocationFailure, OSError, ValueError, TypeError, KeyError):
+        raise LocationFailure('sample_invalid') from None
+
+
+def probe_location(ui_dispatch=None, *, source='windows', sample_path=None):
     """Local quality check only. Never return coordinates or call the school API."""
     try:
-        if ui_dispatch is not None:
+        if source == 'windows' and ui_dispatch is not None:
             permission = request_permission(ui_dispatch)
             if permission != 'ALLOWED':
                 raise LocationFailure('denied' if permission == 'DENIED' else 'unspecified')
-        position = validate_position(read_position())
+        position = locate(source, sample_path)
         accuracy = round(position['accuracy'], 1)
-        return {'state':'ready', 'message':f'定位检测通过，精度约 {accuracy:g} 米。未提交打卡；正式提交时会重新获取位置。',
+        message = (f'模拟定位检测通过，采样精度约 {accuracy:g} 米。基于本机样本并随机偏移，并非当前位置；未提交打卡。'
+                   if source == 'simulation' else
+                   f'定位检测通过，精度约 {accuracy:g} 米。未提交打卡；正式提交时会重新获取位置。')
+        return {'state':'ready', 'message':message,
                 'accuracy':accuracy, 'checked':dt.datetime.now().strftime('%H:%M:%S')}
     except LocationFailure as exc:
         return {'state':exc.code, 'message':str(exc), 'accuracy':None,

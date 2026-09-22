@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -6,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from desktop_bridge import DesktopBridge, PreviewBridge
 from campus_auth_gui import GuiSettings
-from dorm_checkin import Result, Settings
+from dorm_checkin import Result, Settings, Store
 
 
 class DesktopBridgeTests(unittest.TestCase):
@@ -17,6 +18,7 @@ class DesktopBridgeTests(unittest.TestCase):
         self.controller.latest = Result('idle', '尚未查询今日任务')
         self.controller.busy = False
         self.controller.store.settings.return_value = Settings()
+        self.controller.store.root = Path(self.tmp.name) / 'dorm'
         self.controller.store.history.return_value = ''
         self.controller.schedule_text.return_value = '自动打卡：关闭'
         self.controller.drain.return_value = []
@@ -86,7 +88,8 @@ class DesktopBridgeTests(unittest.TestCase):
         with patch('desktop_bridge.probe_location', return_value=result) as probe:
             self.assertTrue(self.bridge.dispatch('location_authorize')['ok'])
             self.bridge._location_worker.join(2)
-        probe.assert_called_once_with(ui_dispatch=self.bridge._ui_dispatch)
+        probe.assert_called_once_with(ui_dispatch=self.bridge._ui_dispatch, source='windows',
+                                      sample_path=self.controller.store.root / 'location-sample.json')
         self.controller.start.assert_not_called()
         self.assertEqual(self.bridge.snapshot()['location']['state'], 'ready')
 
@@ -99,6 +102,62 @@ class DesktopBridgeTests(unittest.TestCase):
             self.assertTrue(preview.dispatch('location_authorize')['ok'])
             self.assertEqual(preview.snapshot()['location']['state'], 'ready')
             probe.assert_not_called()
+
+    def test_saved_source_resets_previous_probe_and_applies_to_detection(self):
+        self.controller.store = Store(Path(self.tmp.name) / 'dorm')
+        self.controller.save.side_effect = self.controller.store.save_settings
+        self.bridge._location_state = dict(state='ready', message='旧检测', accuracy=50, checked='21:00')
+        payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='simulation')
+        self.assertTrue(self.bridge.dispatch('dorm_save', payload)['ok'])
+        self.assertEqual(getattr(self.controller.store.settings(), 'location_source', None), 'simulation')
+        self.assertEqual(self.bridge.snapshot()['location']['state'], 'idle')
+        sample_path = self.controller.store.root / 'location-sample.json'
+        sample_path.write_text(json.dumps(dict(latitude=39.908823, longitude=116.397470,
+                                               accuracy=141, timestamp=1700000000, source='WI_FI')), encoding='utf-8')
+        with (patch('dorm_location.request_permission', side_effect=AssertionError('No simulated permission')),
+              patch('dorm_location.read_position', side_effect=AssertionError('No simulated live position'))):
+            self.assertTrue(self.bridge.dispatch('location_authorize')['ok'])
+            self.bridge._location_worker.join(2)
+        state = self.bridge.snapshot()['location']
+        self.assertEqual(state['state'], 'ready')
+        self.assertAlmostEqual(state['accuracy'], 141, delta=141 * 0.15)
+        self.assertIn('模拟', state['message'])
+        self.assertNotIn('latitude', state)
+        self.controller.start.assert_not_called()
+
+    def test_source_cannot_change_during_location_probe(self):
+        self.bridge._location_gate.acquire()
+        try:
+            payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='simulation')
+            self.assertFalse(self.bridge.dispatch('dorm_save', payload)['ok'])
+            self.controller.save.assert_not_called()
+        finally:
+            self.bridge._location_gate.release()
+
+    def test_unknown_location_source_does_not_save(self):
+        payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='unknown')
+        self.assertFalse(self.bridge.dispatch('dorm_save', payload)['ok'])
+        self.controller.save.assert_not_called()
+
+    def test_valid_save_can_recover_corrupt_settings(self):
+        self.controller.store = Store(Path(self.tmp.name))
+        self.controller.save.side_effect = self.controller.store.save_settings
+        (self.controller.store.root / 'settings.json').write_text('{', encoding='utf-8')
+        payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='windows')
+        self.assertTrue(self.bridge.dispatch('dorm_save', payload)['ok'])
+        self.assertEqual(self.controller.store.settings().location_source, 'windows')
+
+    def test_preview_uses_saved_source_without_reading_real_samples(self):
+        preview = PreviewBridge(real_location=True)
+        payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='simulation')
+        self.assertTrue(preview.dispatch('dorm_save', payload)['ok'])
+        self.assertEqual(preview.snapshot()['dorm']['settings'].get('location_source'), 'simulation')
+        with patch('desktop_bridge.probe_location', side_effect=AssertionError('Preview cannot read local samples')):
+            self.assertTrue(preview.dispatch('location_authorize')['ok'])
+        self.assertIn('模拟', preview.snapshot()['location']['message'])
+        payload['location_source'] = 'windows'
+        self.assertTrue(preview.dispatch('dorm_save', payload)['ok'])
+        self.assertEqual(preview.snapshot()['location']['state'], 'idle')
 
 
 if __name__ == '__main__':

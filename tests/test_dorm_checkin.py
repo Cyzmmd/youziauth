@@ -39,9 +39,30 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.run(automatic=True).state, 'disabled')
         self.api.user.assert_not_called()
 
+    def test_location_source_defaults_to_windows_for_existing_settings(self):
+        self.store._write('settings.json', {'enabled': False, 'start': '21:00', 'end': '23:30', 'interval': 300})
+        self.assertEqual(getattr(Store(self.store.root).settings(), 'location_source', None), 'windows')
+
+    def test_location_source_is_persisted_and_validated(self):
+        self.assertIn('location_source', Settings.__dataclass_fields__)
+        self.store.save_settings(Settings(location_source='simulation'))
+        self.assertEqual(Store(self.store.root).settings().location_source, 'simulation')
+        for source in ('unknown', '', None):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                self.store.save_settings(Settings(location_source=source))
+
     def test_query_never_submits_or_reads_position(self):
         result = self.engine.run()
         self.assertEqual(result.state, 'ready')
+        self.api.submit.assert_not_called()
+        self.position.assert_not_called()
+
+    def test_query_with_an_old_pending_task_never_submits_a_new_task(self):
+        import dataclasses
+        previous = dataclasses.replace(self.task, id='previous-task', date='2026-09-20')
+        self.store.set_pending(previous.key)
+        self.assertEqual(self.engine.run(submit=False).state, 'ready')
+        self.assertTrue(self.store.pending(previous.key))
         self.api.submit.assert_not_called()
         self.position.assert_not_called()
 

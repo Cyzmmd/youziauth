@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',records:'运行记录'};
-let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, timer;
+let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer;
 const dirty = {network:false, dorm:false};
 const revisions = {network:0, dorm:0};
 let api;
@@ -37,18 +37,35 @@ function markDirty(kind, value) {
 }
 ['network','dorm'].forEach(kind=>$(kind+'-form').addEventListener('input',()=>{revisions[kind]++;markDirty(kind,true);}));
 
+function savedLocationSource(){return state?.dorm.settings.location_source||'windows';}
+function requireSavedLocationSource(){
+  if(!state||syncedEpoch!==epoch){notify('定位设置尚未同步，请稍后重试。',true);return false;}
+  if($('location-source').value===savedLocationSource())return true;
+  notify('请先保存定位来源，再检测或提交。',true);
+  location.hash='dorm';$('location-source').focus();
+  return false;
+}
 function render() {
   if(!state) return;
-  const n=state.network,d=state.dorm;
+  const n=state.network,d=state.dorm,simulation=savedLocationSource()==='simulation';
   $('preview-tag').hidden = !state.preview;
   $('preview-tag').textContent = state.location_diagnostic ? '真实定位诊断 · 其他功能为演示' : '演示预览';
-  const locationState=state.location||{state:'idle',message:'点击按钮授权并检测定位，不会提交打卡。',busy:false};
-  $('location-message').textContent=locationState.message;
+  badge('location-source-badge',simulation?'当前来源 · 模拟定位（非实时）':'当前来源 · 真实定位（Windows）',simulation?'warning':'');
+  $('location-mode-hint').textContent=simulation
+    ? '使用已保存样本中的固定采样位置，并非当前位置；无需 Windows 定位授权。'
+    : '实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。';
+  $('location-submit-hint').textContent=simulation
+    ? '提交时会向学校发送登录凭据、任务字段及已保存的模拟位置（非实时）。仍须通过学校验证，学校仍可拒绝。'
+    : '提交时会向学校发送登录凭据、任务字段及 Windows 实时位置。位置不可用或精度不足时停止，仍须通过学校验证。';
+  const locationState=state.location||{state:'idle',message:simulation?'点击按钮检测已保存的模拟位置，不会提交打卡。':'点击按钮授权并检测定位，不会提交打卡。',busy:false};
+  $('location-message').textContent=(simulation&&locationState.state==='ready'?'模拟定位（非实时）· ':'')+locationState.message;
   $('location-message').classList.toggle('location-success',locationState.state==='ready');
   $('location-message').classList.toggle('location-error',!['idle','checking','ready'].includes(locationState.state));
-  $('authorize-location').disabled=pending||locationState.busy;
-  $('authorize-location').textContent=locationState.busy?'正在授权 / 检测…':'授权并检测定位';
-  $('location-checked').textContent=locationState.checked ? '最近检测 · '+locationState.checked : '仅检测定位，不会提交打卡';
+  $('authorize-location').disabled=pending||syncedEpoch!==epoch||locationState.busy;
+  $('authorize-location').textContent=simulation
+    ? (locationState.busy?'正在检测模拟定位…':'检测模拟定位')
+    : (locationState.busy?'正在授权 / 检测…':'授权并检测定位');
+  $('location-checked').textContent=locationState.checked ? (simulation?'最近模拟检测 · ':'最近检测 · ')+locationState.checked : '仅检测定位，不会提交打卡';
   $('network-status').textContent=n.message;
   $('network-summary').textContent=n.message;
   $('checked-label').textContent=n.checked ? '最近检测 · '+n.checked : '尚未执行连接检测';
@@ -68,18 +85,18 @@ function render() {
   $('overview-attention').textContent=n.state!=='online'?'从一次连接检测开始':d.state==='signed'?'今天的安排，已妥当':d.state==='ready'?'别忘了今晚的寝室打卡':'看看今天的寝室安排';
   $('task-title').textContent=d.task?d.task.title:'先看看今天的安排';
   $('task-message').textContent=d.busy?'正在处理，请稍候；学校登录可能需要在浏览器中完成。':d.message;
-  if(d.state==='location_required'&&locationState.state==='ready'&&!d.busy)$('task-message').textContent='定位检测已通过。请查询今日任务，刷新任务状态后再提交。';
+  if(d.state==='location_required'&&locationState.state==='ready'&&!d.busy)$('task-message').textContent=(simulation?'模拟定位检测已通过（非实时）。':'定位检测已通过。')+'请查询今日任务，刷新任务状态后再提交。';
   $('task-details').hidden=!d.task;
   if(d.task){$('task-date').textContent=d.task.date;$('task-time').textContent=d.task.start+'–'+d.task.end;$('task-address').textContent=d.task.address||'以学校任务为准';}
   $('schedule').textContent=d.schedule;
   if(!dirty.network){$('username').value=n.username;$('interval').value=n.interval;$('startup').checked=n.startup;}
-  if(!dirty.dorm){$('auto-enabled').checked=d.settings.enabled;$('auto-start').value=d.settings.start;$('auto-end').value=d.settings.end;$('auto-interval').value=d.settings.interval;}
+  if(!dirty.dorm){$('auto-enabled').checked=d.settings.enabled;$('auto-start').value=d.settings.start;$('auto-end').value=d.settings.end;$('auto-interval').value=d.settings.interval;$('location-source').value=savedLocationSource();}
   $('password-hint').textContent=n.has_password?'已保存加密密码；留空保存即可保留。':'尚未保存密码，请填写后保存。';
   document.querySelectorAll('[data-action="network_check"]').forEach(b=>b.disabled=pending||n.busy||(!n.startup&&n.monitoring));
   document.querySelectorAll('[data-action="network_start"]').forEach(b=>b.disabled=pending||n.busy||n.monitoring);
   document.querySelectorAll('[data-action="network_stop"]').forEach(b=>b.disabled=pending||!n.monitoring||n.startup);
   document.querySelectorAll('[data-action="dorm_login"],[data-action="dorm_query"]').forEach(b=>b.disabled=pending||d.busy);
-  $('submit-dorm').disabled=pending||d.busy||!['ready','uncertain'].includes(d.state);
+  $('submit-dorm').disabled=pending||syncedEpoch!==epoch||d.busy||!['ready','uncertain'].includes(d.state);
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
   $('cancel-dorm').disabled=pending||!d.busy;
   $('logout-dorm').disabled=pending||d.busy;
@@ -91,17 +108,27 @@ async function refresh(){
   if(!api)return;
   if(refreshTask)return refreshTask;
   const started=epoch;
-  refreshTask=(async()=>{try{const next=await api.snapshot();if(started!==epoch)return;state=next;$('connection-error').hidden=true;render();}catch(error){$('connection-error').hidden=false;}})();
+  refreshTask=(async()=>{
+    try{const next=await api.snapshot();if(started!==epoch)return;state=next;syncedEpoch=started;$('connection-error').hidden=true;render();}
+    catch(error){if(started!==epoch)return;syncedEpoch=-1;$('connection-error').hidden=false;render();}
+  })();
   try{await refreshTask;}finally{refreshTask=null;}
 }
 async function act(action,payload={}){
   if(!api||pending)return false;
+  const simulation=savedLocationSource()==='simulation'&&(action==='location_authorize'||(action==='dorm_submit'&&state.dorm.state!=='uncertain'));
   pending=true;epoch++;render();
-  try{const result=await api.dispatch(action,payload);notify(result.message,!result.ok);return result.ok;}catch(error){notify('操作未完成，请检查后台连接后重试。',true);return false;}finally{pending=false;epoch++;if(refreshTask)await refreshTask;await refresh();render();}
+  let ok=false;
+  try{const result=await api.dispatch(action,payload);ok=result.ok;notify((simulation?'模拟定位（非实时）· ':'')+result.message,!ok);}
+  catch(error){notify('操作未完成，请检查后台连接后重试。',true);}
+  finally{pending=false;epoch++;if(refreshTask)await refreshTask;await refresh();render();}
+  if(ok&&syncedEpoch!==epoch)notify('操作已执行，但状态尚未同步，请等待状态刷新后再继续。',true);
+  return ok&&syncedEpoch===epoch;
 }
 document.querySelectorAll('[data-action]').forEach(button=>button.addEventListener('click',()=>{
   const action=button.dataset.action;
   if(['network_check','network_start'].includes(action)&&dirty.network){notify('校园网设置尚未保存，请先保存再检测。',true);location.hash='network';return;}
+  if(action==='location_authorize'&&!requireSavedLocationSource())return;
   act(action);
 }));
 $('network-form').addEventListener('submit',async event=>{
@@ -112,7 +139,7 @@ $('network-form').addEventListener('submit',async event=>{
 });
 $('dorm-form').addEventListener('submit',async event=>{
   event.preventDefault();
-  const payload={enabled:$('auto-enabled').checked,start:$('auto-start').value,end:$('auto-end').value,interval:Number($('auto-interval').value)};
+  const payload={enabled:$('auto-enabled').checked,start:$('auto-start').value,end:$('auto-end').value,interval:Number($('auto-interval').value),location_source:$('location-source').value};
   if(payload.start>=payload.end){notify('结束时间必须晚于开始时间，暂不支持跨日时段。',true);return;}
   const revision=revisions.dorm;
   if(await act('dorm_save',payload)){if(revision===revisions.dorm)markDirty('dorm',false);render();}
@@ -123,7 +150,20 @@ function confirmAction(title,text,action){previousFocus=document.activeElement;$
 $('confirm-cancel').onclick=()=>$('confirm-dialog').close();
 $('confirm-dialog').addEventListener('close',()=>{confirmation=null;previousFocus?.focus();});
 $('confirm-ok').onclick=()=>{const action=confirmation;$('confirm-dialog').close();if(action)action();};
-$('submit-dorm').onclick=()=>confirmAction(state.dorm.state==='uncertain'?'回查提交结果？':'提交今日打卡？','将使用 Windows 实时定位，向学校发送登录凭据、任务字段和位置。提交后会回查学校结果。',()=>act('dorm_submit'));
+$('submit-dorm').onclick=()=>{
+  if(!requireSavedLocationSource())return;
+  const source=savedLocationSource(),recheck=state.dorm.state==='uncertain';
+  const text=recheck
+    ? '仅向学校查询已有提交结果，不会重新提交打卡，也不会读取或发送新的位置坐标。'
+    : (source==='simulation'
+      ? '将使用已保存的模拟位置（固定采样位置，非实时，并非当前位置），向学校发送登录凭据、任务字段和该位置。'
+      : '将使用 Windows 实时定位，向学校发送登录凭据、任务字段和位置。')+'仍须通过学校验证，学校仍可拒绝。提交后会回查学校结果。';
+  confirmAction(recheck?'回查提交结果？':'提交今日打卡？',text,()=>{
+    if(!requireSavedLocationSource())return;
+    if(source!==savedLocationSource()||recheck!==(state.dorm.state==='uncertain')){notify('定位来源或任务状态已变化，请重新确认。',true);return;}
+    act(recheck?'dorm_query':'dorm_submit');
+  });
+};
 $('logout-dorm').onclick=()=>confirmAction('清除学校登录凭据？','这会同时关闭自动打卡。校园网账号不受影响，下次打卡需要重新登录学校账号。',async()=>{if(await act('dorm_logout')){markDirty('dorm',false);render();}});
 $('quit').onclick=()=>confirmAction('退出 youziauth？','退出将停止本程序的后台检测和自动打卡。已启用的系统认证代理仍会运行。',()=>act('quit'));
 $('refresh-records').onclick=async()=>{await refresh();if($('connection-error').hidden)notify('运行记录已刷新');};

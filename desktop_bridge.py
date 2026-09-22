@@ -31,7 +31,8 @@ def network_settings(payload, previous):
 
 def dorm_settings(payload):
     return Settings(payload.get('enabled', False), str(payload.get('start', '')),
-                    str(payload.get('end', '')), int(payload.get('interval', 300))).validate()
+                    str(payload.get('end', '')), int(payload.get('interval', 300)),
+                    payload.get('location_source', 'windows')).validate()
 
 
 class LocationProbe:
@@ -39,30 +40,40 @@ class LocationProbe:
         self._ui_dispatch = None
         self._location_gate = threading.Lock()
         self._location_worker = None
-        self._location_state = {'state':'idle', 'message':'点击下方按钮请求系统授权并检测实时定位，不会提交打卡。',
+        self._reset_location('windows')
+
+    def _reset_location(self, source):
+        message = ('使用本机已保存的模拟定位样本，并非当前位置；检测不会提交打卡。'
+                   if source == 'simulation' else '点击下方按钮请求系统授权并检测实时定位，不会提交打卡。')
+        self._location_state = {'state':'idle', 'message':message, 'source':source,
                                 'accuracy':None, 'checked':''}
 
-    def _location_snapshot(self):
+    def _location_snapshot(self, source):
+        if self._location_state.get('source') != source:
+            self._reset_location(source)
         return dict(self._location_state, busy=self._location_gate.locked())
 
-    def _start_location_probe(self):
-        if self._ui_dispatch is None:
+    def _start_location_probe(self, *, source='windows', sample_path=None):
+        if source == 'windows' and self._ui_dispatch is None:
             raise RuntimeError('请在桌面主窗口中使用定位授权功能。')
         if not self._location_gate.acquire(blocking=False):
             raise RuntimeError('正在等待授权或定位结果，请稍候。')
-        self._location_state = {'state':'checking','message':'请在系统提示中选择允许，随后等待实时定位（约 30 秒内）。',
+        message = ('正在读取本机模拟定位样本，不会读取实时位置或提交打卡。' if source == 'simulation' else
+                   '请在系统提示中选择允许，随后等待实时定位（约 30 秒内）。')
+        self._location_state = {'state':'checking','message':message, 'source':source,
                                 'accuracy':None,'checked':''}
         def work():
             try:
-                self._location_state = probe_location(ui_dispatch=self._ui_dispatch)
+                self._location_state = dict(probe_location(ui_dispatch=self._ui_dispatch, source=source,
+                                                           sample_path=sample_path), source=source)
             except Exception:
-                self._location_state = {'state':'error','message':'定位检测未完成，请保持主窗口在前台后重试。',
-                                        'accuracy':None,'checked':''}
+                self._location_state = {'state':'error','message':'定位检测未完成，请检查所选来源后重试。',
+                                        'source':source,'accuracy':None,'checked':''}
             finally:
                 self._location_gate.release()
         self._location_worker = threading.Thread(target=work,daemon=True,name='youziauth-location-probe')
         self._location_worker.start()
-        return '正在请求系统定位授权；本次只检测定位，不会提交打卡。'
+        return '正在检测所选定位来源；本次不会提交打卡。'
 
 
 class DesktopBridge(LocationProbe):
@@ -96,7 +107,7 @@ class DesktopBridge(LocationProbe):
             task = result.task
             return {
                 'preview': False,
-                'location': self._location_snapshot(),
+                'location': self._location_snapshot(ds.location_source),
                 'network': {
                     'username': '' if settings.username == 'YOUR_STUDENT_ID' else settings.username,
                     'interval': settings.check_interval_seconds, 'startup': self._agent,
@@ -137,7 +148,8 @@ class DesktopBridge(LocationProbe):
 
     def _dispatch(self, action, payload):
         if action == 'location_authorize':
-            return self._start_location_probe()
+            return self._start_location_probe(source=self._dorm.store.settings().location_source,
+                                              sample_path=self._dorm.store.root / 'location-sample.json')
         if action == 'network_save':
             settings = network_settings(payload, gui.load_gui_settings(self._config))
             startup = payload.get('startup', False)
@@ -185,10 +197,13 @@ class DesktopBridge(LocationProbe):
             self._dorm.cancel()
             return '已请求取消；已发出的提交不能撤回，自动打卡设置不会改变。'
         if action == 'dorm_save':
-            if self._dorm.busy:
-                raise RuntimeError('请等待当前打卡操作完成后再保存设置。')
-            self._dorm.save(dorm_settings(payload))
-            return '自动打卡设置已保存'
+            if self._dorm.busy or self._location_gate.locked():
+                raise RuntimeError('请等待当前打卡或定位检测完成后再保存设置。')
+            settings = dorm_settings(payload)
+            self._dorm.save(settings)
+            if settings.location_source != self._location_state.get('source'):
+                self._reset_location(settings.location_source)
+            return '定位来源与自动打卡设置已保存'
         if action == 'location_settings':
             os.startfile('ms-settings:privacy-location')
             return '已打开 Windows 定位设置'
@@ -271,7 +286,8 @@ class PreviewBridge(LocationProbe):
         }
 
     def snapshot(self):
-        return dict(copy.deepcopy(self._data), location=self._location_snapshot(),
+        return dict(copy.deepcopy(self._data),
+                    location=self._location_snapshot(self._data['dorm']['settings']['location_source']),
                     location_diagnostic=self._real_location)
 
     def dispatch(self, action, payload=None):
@@ -279,12 +295,15 @@ class PreviewBridge(LocationProbe):
         n, d = self._data['network'], self._data['dorm']
         try:
             if action == 'location_authorize':
-                if self._real_location:
+                source = d['settings']['location_source']
+                if self._real_location and source == 'windows':
                     try:
                         return {'ok':True,'message':self._start_location_probe()}
                     except RuntimeError as exc:
                         return {'ok':False,'message':str(exc)}
-                self._location_state = {'state':'ready','message':'定位检测通过（演示）；未读取真实位置。',
+                message = ('模拟定位检测通过（演示）；未读取本机样本或实时位置。' if source == 'simulation' else
+                           '定位检测通过（演示）；未读取真实位置。')
+                self._location_state = {'state':'ready','message':message,'source':source,
                                         'accuracy':50,'checked':'演示'}
             elif action == 'network_save':
                 value = network_settings(payload, gui.GuiSettings())
@@ -296,7 +315,12 @@ class PreviewBridge(LocationProbe):
             elif action == 'network_stop':
                 n.update(monitoring=False, state='stopped', message='后台检测已停止（演示）')
             elif action == 'dorm_save':
-                d['settings'] = dataclasses.asdict(dorm_settings(payload))
+                if self._location_gate.locked():
+                    return {'ok':False, 'message':'请等待定位检测完成后再保存设置。'}
+                settings = dorm_settings(payload)
+                if settings.location_source != d['settings']['location_source']:
+                    self._reset_location(settings.location_source)
+                d['settings'] = dataclasses.asdict(settings)
                 d['schedule'] = '自动打卡：' + ('开启（演示）' if d['settings']['enabled'] else '关闭')
             elif action == 'dorm_login':
                 d.update(state='logged_in', message='学校登录成功（演示，不会打开真实认证）')

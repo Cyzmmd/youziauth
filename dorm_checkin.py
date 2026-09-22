@@ -37,10 +37,13 @@ class Settings:
     start: str = '21:00'
     end: str = '23:30'
     interval: int = 300
+    location_source: str = 'windows'
 
     def validate(self):
         if type(self.enabled) is not bool:
             raise ValueError('自动打卡开关无效')
+        if self.location_source not in ('windows', 'simulation'):
+            raise ValueError('定位来源无效')
         if parse_time(self.start) >= parse_time(self.end):
             raise ValueError('检查结束时间必须晚于开始时间，不支持跨日时段')
         if type(self.interval) is not int or not 60 <= self.interval <= 3600:

@@ -46,8 +46,34 @@
       <section class="page" id="dorm" aria-labelledby="dorm-title" hidden>
         <div class="page-heading"><div><div class="eyebrow">一天的收尾，也从容一些</div><h1 id="dorm-title">寝室打卡</h1><p class="muted">查看学校今日安排，在有效时段内完成打卡。</p></div><button class="secondary" data-action="dorm_login"><i class="bi bi-person-check" aria-hidden="true"></i> 学校登录 / 重新登录</button></div>
         <article class="paper-card task-card"><div class="card-label"><span><i class="bi bi-journal-check" aria-hidden="true"></i> 今日任务</span><span class="badge" id="task-badge">待查询</span></div><h2 id="task-title">先看看今天的安排</h2><p class="muted" id="task-message">查询今日任务，不会提交打卡。</p><div class="task-details" id="task-details" hidden><div><span>任务日期</span><strong id="task-date"></strong></div><div><span>学校时段</span><strong id="task-time"></strong></div><div><span>打卡地点</span><strong id="task-address"></strong></div></div><div class="task-actions"><button class="primary" id="submit-dorm">提交今日打卡 <i class="bi bi-arrow-right" aria-hidden="true"></i></button><button class="secondary" data-action="dorm_query">查询今日任务</button><button class="text-button" data-action="dorm_cancel" id="cancel-dorm">取消当前操作</button></div></article>
-        <div class="detail-grid"><form class="paper-card form-card" id="dorm-form"><div class="card-label"><h3>自动打卡</h3><input id="auto-enabled" type="checkbox" role="switch" aria-label="启用自动打卡"></div><p class="muted small">在你设置的时段内定期检查，保存后生效。</p><div class="time-fields"><div><label for="auto-start">开始时间</label><input id="auto-start" type="time" value="21:00" required></div><span>至</span><div><label for="auto-end">结束时间</label><input id="auto-end" type="time" value="23:30" required></div></div><div class="setting-row"><div><label for="auto-interval">检查间隔</label><p class="field-hint">60–3600 秒</p></div><div class="number-field"><input id="auto-interval" type="number" min="60" max="3600" value="300" required><span>秒</span></div></div><p class="schedule" id="schedule">自动打卡：关闭</p><div class="form-footer"><span class="form-state" id="dorm-save-state">设置已同步</span><button type="submit" class="primary">保存打卡设置</button></div></form>
-        <aside class="side-stack"><article class="paper-card compact"><h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 关于定位与登录</h3><div class="location-check" aria-live="polite"><p id="location-message">点击下方按钮请求系统授权并检测实时定位，不会提交打卡。</p><small id="location-checked">仅检测定位，不会提交打卡</small></div><button class="primary full" id="authorize-location" data-action="location_authorize">授权并检测定位</button><p class="field-hint">如 Windows 弹出权限提示，请选择允许；已拒绝的权限需要在系统设置中重新开启。</p><p class="muted small">提交时会向学校发送登录凭据、任务字段及 Windows 实时位置。位置不可用或精度不足时停止。</p><p class="muted small">自动执行需电脑开机、登录 Windows，并保持软件运行；实际提交仍须在学校任务时段内。</p><button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button></article></aside></div>
+        <div class="detail-grid">
+          <form class="paper-card form-card" id="dorm-form">
+            <div class="card-label"><h3>自动打卡</h3><input id="auto-enabled" type="checkbox" role="switch" aria-label="启用自动打卡"></div>
+            <p class="muted small">在你设置的时段内定期检查，保存后生效。</p>
+            <div class="time-fields"><div><label for="auto-start">开始时间</label><input id="auto-start" type="time" value="21:00" required></div><span>至</span><div><label for="auto-end">结束时间</label><input id="auto-end" type="time" value="23:30" required></div></div>
+            <div class="setting-row"><div><label for="auto-interval">检查间隔</label><p class="field-hint">60–3600 秒</p></div><div class="number-field"><input id="auto-interval" type="number" min="60" max="3600" value="300" required><span>秒</span></div></div>
+            <p class="schedule" id="schedule">自动打卡：关闭</p>
+            <div class="location-source-settings">
+              <label for="location-source">全局定位来源</label>
+              <select id="location-source" name="location_source" aria-describedby="location-source-scope" required>
+                <option value="windows">真实定位（Windows / Wi-Fi）</option>
+                <option value="simulation">模拟定位（已保存样本）</option>
+              </select>
+              <p class="field-hint" id="location-source-scope">保存后全局生效：定位检测、手动提交和自动打卡。默认真实定位，重启后保留已保存的选择。</p>
+            </div>
+            <div class="form-footer"><span class="form-state" id="dorm-save-state">设置已同步</span><button type="submit" class="primary">保存打卡设置</button></div>
+          </form>
+          <aside class="side-stack"><article class="paper-card compact">
+            <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 关于定位与登录</h3>
+            <span class="badge" id="location-source-badge" aria-live="polite">当前来源 · 真实定位（Windows）</span>
+            <div class="location-check" aria-live="polite"><p id="location-message">点击下方按钮请求系统授权并检测实时定位，不会提交打卡。</p><small id="location-checked">仅检测定位，不会提交打卡</small></div>
+            <button class="primary full" id="authorize-location" data-action="location_authorize">授权并检测定位</button>
+            <p class="field-hint" id="location-mode-hint">实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
+            <p class="muted small" id="location-submit-hint">提交时会向学校发送登录凭据、任务字段及 Windows 实时位置。位置不可用或精度不足时停止，仍须通过学校验证。</p>
+            <p class="muted small">自动执行需电脑开机、登录 Windows，并保持软件运行；实际提交仍须在学校任务时段内。</p>
+            <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button>
+          </article></aside>
+        </div>
       </section>
 
       <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre></article><p class="field-hint">向他人分享记录前，请检查并隐藏账号、IP 等个人信息。</p></section>

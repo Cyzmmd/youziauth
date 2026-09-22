@@ -1,12 +1,29 @@
+import contextlib
 import importlib.util
+import io
+import json
+import math
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from dorm_checkin import CheckinError
 
 PRESENT = importlib.util.find_spec('dorm_location') is not None
 if PRESENT:
     from dorm_location import validate_position, wgs84_to_gcj02
+
+
+def metres_between(lat_a, lng_a, lat_b, lng_b):
+    """Haversine distance, independent of the module's own drift maths."""
+    earth = 6_371_000.0
+    phi_a, phi_b = math.radians(lat_a), math.radians(lat_b)
+    delta_phi = phi_b - phi_a
+    delta_lambda = math.radians(lng_b - lng_a)
+    chord = (math.sin(delta_phi / 2) ** 2
+             + math.cos(phi_a) * math.cos(phi_b) * math.sin(delta_lambda / 2) ** 2)
+    return 2 * earth * math.asin(math.sqrt(chord))
 
 
 class LocationProviderTests(unittest.TestCase):
@@ -86,6 +103,177 @@ class LocationTests(unittest.TestCase):
 
     def test_outside_china_coordinates_are_unchanged(self):
         self.assertEqual(wgs84_to_gcj02(51.5, -0.1), (51.5, -0.1))
+
+
+class SimulatedLocationTests(unittest.TestCase):
+    def setUp(self):
+        import dorm_location
+        self.assertTrue(callable(getattr(dorm_location, 'simulate_location', None)),
+                        'Shared location replay is not implemented')
+        self.simulate = dorm_location.simulate_location
+        self.sample = dict(latitude=39.908823, longitude=116.397470, accuracy=141,
+                           timestamp=1700000000, source='WI_FI')
+        clock = patch('time.time', return_value=1700000300)
+        clock.start()
+        self.addCleanup(clock.stop)
+        location = patch('dorm_location.read_position', side_effect=AssertionError('Unexpected live location'))
+        location.start()
+        self.addCleanup(location.stop)
+        network = patch('socket.socket.connect', side_effect=AssertionError('Unexpected network access'))
+        network.start()
+        self.addCleanup(network.stop)
+
+    def sample_point(self):
+        """The sample's own position, converted exactly the way a replay is."""
+        return wgs84_to_gcj02(self.sample['latitude'], self.sample['longitude'])
+
+    def test_replay_converts_the_sample_without_marking_itself_for_the_school(self):
+        result = self.simulate(self.sample)
+        self.assertLess(metres_between(result['latitude'], result['longitude'], *self.sample_point()), 25)
+        self.assertNotIn('simulation', result.values())
+        self.assertAlmostEqual(result['accuracy'], 141, delta=141 * 0.15)
+        self.assertGreater(result['accuracy'], 0)
+        self.assertEqual(result['time'], 1700000300000)
+        self.assertTrue(result['isOffset'])
+        self.assertEqual(result['address'], '')
+
+    def test_every_replay_drifts_within_a_bounded_radius(self):
+        distances = []
+        for _ in range(200):
+            result = self.simulate(self.sample)
+            distances.append(metres_between(result['latitude'], result['longitude'], *self.sample_point()))
+        self.assertLessEqual(max(distances), 25.001)
+        self.assertGreater(max(distances), 20)  # the drift is real, not a no-op
+
+    def test_replays_never_repeat_the_same_numbers(self):
+        keys = ('latitude', 'longitude', 'accuracy')
+        seen = {json.dumps([self.simulate(self.sample)[key] for key in keys]) for _ in range(50)}
+        self.assertEqual(len(seen), 50)
+
+    def test_drift_stays_clear_of_the_acceptance_limit(self):
+        for accuracy in (5, 141, 199, 200):
+            with self.subTest(accuracy=accuracy):
+                sample = dict(self.sample, accuracy=accuracy)
+                for _ in range(50):
+                    result = self.simulate(sample)
+                    self.assertGreater(result['accuracy'], 0)
+                    self.assertLessEqual(result['accuracy'], 200)
+
+    def test_replay_reports_the_same_provider_as_a_live_fix(self):
+        live = validate_position(dict(self.sample, timestamp=time.time(), source='WI_FI'))
+        replay = self.simulate(self.sample)
+        self.assertEqual(replay['provider'], live['provider'])
+        self.assertEqual(set(replay), set(live))
+
+    def test_replay_does_not_mutate_the_captured_sample(self):
+        original = dict(self.sample)
+        self.simulate(self.sample, latitude=51.5, longitude=-0.1, accuracy=12)
+        self.assertEqual(self.sample, original)
+
+    def test_explicit_coordinates_accuracy_and_timestamp_are_used(self):
+        result = self.simulate(self.sample, latitude=0, longitude=0,
+                               accuracy=12.5, timestamp=1700000299.75)
+        self.assertEqual(result['latitude'], 0)
+        self.assertEqual(result['longitude'], 0)
+        self.assertEqual(result['accuracy'], 12.5)
+        self.assertEqual(result['time'], 1700000299750)
+
+    def test_invalid_or_stale_overrides_keep_existing_quality_checks(self):
+        for change in ({'latitude': 91}, {'longitude': float('nan')},
+                       {'accuracy': 201}, {'accuracy': 0}, {'timestamp': 1700000000}):
+            with self.subTest(change=change), self.assertRaises(CheckinError):
+                self.simulate(self.sample, **change)
+
+    def test_replay_does_not_relabel_coarse_sources_as_wifi(self):
+        for source in ('DEFAULT', 'IP_ADDRESS', 'OBFUSCATED'):
+            with self.subTest(source=source), self.assertRaises(CheckinError):
+                self.simulate(dict(self.sample, source=source))
+
+
+class SimulatedLocationCliTests(unittest.TestCase):
+    def setUp(self):
+        import dorm_selftest
+        self.assertTrue(callable(getattr(dorm_selftest, 'location_main', None)),
+                        'Local location replay command is not implemented')
+        self.main = dorm_selftest.location_main
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.sample_path = Path(directory.name) / 'sample.json'
+        self.sample_path.write_text(json.dumps(dict(latitude=39.908823, longitude=116.397470,
+                                                    accuracy=141, timestamp=1700000000,
+                                                    source='WI_FI')), encoding='utf-8')
+        for guard in (patch('time.time', return_value=1700000300),
+                      patch('dorm_location.read_position', side_effect=AssertionError('Unexpected live location')),
+                      patch('socket.socket.connect', side_effect=AssertionError('Unexpected network access'))):
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def invoke(self, *args):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.main([str(self.sample_path), *args])
+        return code, json.loads(output.getvalue())
+
+    def test_cli_replays_local_sample_without_changing_it(self):
+        original = self.sample_path.read_bytes()
+        code, result = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['scope'], 'local-only simulation')
+        self.assertEqual(result['captured_at'], 1700000000)
+        self.assertEqual(result['source'], 'WI_FI')
+        self.assertEqual(result['position']['provider'], validate_position(
+            dict(latitude=39.908823, longitude=116.397470, accuracy=141,
+                 timestamp=time.time(), source='WI_FI'))['provider'])
+        self.assertNotIn('simulation', result['position'].values())
+        self.assertLess(metres_between(result['position']['latitude'], result['position']['longitude'],
+                                       *wgs84_to_gcj02(39.908823, 116.397470)), 25)
+        self.assertEqual(result['position']['time'], 1700000300000)
+        self.assertEqual(self.sample_path.read_bytes(), original)
+
+    def test_cli_replays_differ_between_runs(self):
+        _, first = self.invoke()
+        _, second = self.invoke()
+        self.assertNotEqual(first['position'], second['position'])
+
+    def test_cli_supports_overrides(self):
+        code, result = self.invoke('--latitude', '0', '--longitude', '0',
+                                   '--accuracy', '25', '--timestamp', '1700000299')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['position']['latitude'], 0)
+        self.assertEqual(result['position']['longitude'], 0)
+        self.assertEqual(result['position']['accuracy'], 25)
+        self.assertEqual(result['position']['time'], 1700000299000)
+
+    def test_cli_rejects_missing_or_malformed_samples(self):
+        self.sample_path.unlink()
+        code, result = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertFalse(result['ok'])
+        for content in ('{', 'null', '[]', '{}'):
+            with self.subTest(content=content):
+                self.sample_path.write_text(content, encoding='utf-8')
+                code, result = self.invoke()
+                self.assertEqual(code, 2)
+                self.assertFalse(result['ok'])
+
+    def test_cli_rejects_invalid_original_capture_timestamps(self):
+        sample = json.loads(self.sample_path.read_text(encoding='utf-8'))
+        for timestamp in (None, 'invalid', float('nan'), float('inf')):
+            with self.subTest(timestamp=timestamp):
+                sample['timestamp'] = timestamp
+                self.sample_path.write_text(json.dumps(sample), encoding='utf-8')
+                code, result = self.invoke()
+                self.assertEqual(code, 2)
+                self.assertFalse(result['ok'])
+                self.assertNotIn('position', result)
+
+    def test_cli_reports_quality_failure_without_position(self):
+        code, result = self.invoke('--accuracy', '600')
+        self.assertEqual(code, 2)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['state'], 'inaccurate')
+        self.assertNotIn('position', result)
 
 
 if __name__ == '__main__':
