@@ -8,6 +8,8 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of youziauth is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="YuzuAppIcon" SourceFile="assets\yuzu_app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="YuzuAppIcon" />
 
     <StandardDirectory Id="ProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="youziauth" />
@@ -30,6 +32,7 @@
         Id="ApplicationStartMenuShortcut"
         Name="youziauth"
         Description="youziauth campus network authentication tray app by yoouzic"
+        Icon="YuzuAppIcon"
         Target="[INSTALLFOLDER]youziauth.exe"
         WorkingDirectory="INSTALLFOLDER">
         <ShortcutProperty Key="System.AppUserModel.ID" Value="youziauth" />
@@ -61,9 +64,12 @@
       <Shortcut
         Id="ApplicationDesktopShortcut"
         Name="youziauth"
+        Icon="YuzuAppIcon"
         Description="youziauth campus network authentication tray app by yoouzic"
         Target="[INSTALLFOLDER]youziauth.exe"
-        WorkingDirectory="INSTALLFOLDER" />
+        WorkingDirectory="INSTALLFOLDER">
+        <ShortcutProperty Key="System.AppUserModel.ID" Value="youziauth" />
+      </Shortcut>
       <RegistryValue
         Root="HKCU"
         Key="Software\youziauth"

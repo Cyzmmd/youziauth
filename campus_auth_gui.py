@@ -528,6 +528,7 @@ class CampusAuthGui:
         root,
         config_path: Path = DEFAULT_CONFIG_PATH,
         tray_startup: bool = False,
+        dorm_store=None,
     ):
         if tk is None or ttk is None or messagebox is None:
             raise RuntimeError("Tkinter is not available in this Python installation")
@@ -563,6 +564,10 @@ class CampusAuthGui:
         self.background_label = None
         self.panel_icon_source_image = None
         self.panel_icon_image = None
+        from dorm_panel import DormController
+        self.dorm_controller = DormController(dorm_store)
+        self.dorm_panel = None
+        self._dorm_notice = None
 
         self.username_var = tk.StringVar()
         self.password_var = tk.StringVar()
@@ -583,6 +588,7 @@ class CampusAuthGui:
         self._ensure_tray_icon()
         self._start_ui_command_server()
         self.root.after(500, self._poll_agent_status)
+        self.root.after(1000, self._poll_dorm)
         if self.agent_mode:
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
@@ -910,6 +916,9 @@ class CampusAuthGui:
             text=f"配置文件：{self.config_path.name}",
             style="Panel.TLabel",
         ).grid(row=11, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(settings, text="寝室打卡…", command=self.open_dorm).grid(
+            row=12, column=0, sticky="ew", pady=(10, 0)
+        )
 
         self.logs_panel = ttk.Frame(self.root, padding=(10, 18, 18, 18))
         logs = self.logs_panel
@@ -1201,6 +1210,8 @@ class CampusAuthGui:
             self.open_settings()
         elif command == "check":
             self.run_once()
+        elif command == "dorm":
+            self.open_dorm()
         elif command == "quit":
             self.quit_application()
 
@@ -1235,6 +1246,8 @@ class CampusAuthGui:
         self.username_entry.focus_set()
 
     def quit_application(self) -> None:
+        if hasattr(self, "dorm_controller"):
+            self.dorm_controller.close()
         self.stop_event.set()
         if self.tray_icon is not None:
             self.tray_icon.stop()
@@ -1243,6 +1256,27 @@ class CampusAuthGui:
 
     def close(self) -> None:
         self.quit_application()
+
+    def open_dorm(self) -> None:
+        from dorm_panel import DormPanel
+        if self.dorm_panel is None or not self.dorm_panel.window.winfo_exists():
+            self.dorm_panel = DormPanel(self.root, self.dorm_controller)
+        self.dorm_panel.show()
+
+    def _poll_dorm(self) -> None:
+        self.dorm_controller.poll()
+        for result in self.dorm_controller.drain():
+            if self.dorm_panel is not None and self.dorm_panel.window.winfo_exists():
+                self.dorm_panel.update(result)
+            notice = (result.at[:10] or __import__('datetime').date.today().isoformat(),
+                      result.task.key if result.task else '', result.state)
+            if result.state in ('signed', 'login_required', 'location_required', 'uncertain', 'error', 'network_error'):
+                if notice != self._dorm_notice:
+                    self._dorm_notice = notice
+                    self._show_notification(windows_notifications.build_dorm_toast(result.message))
+        if self.dorm_panel is not None and self.dorm_panel.window.winfo_exists():
+            self.dorm_panel.refresh()
+        self.root.after(1000, self._poll_dorm)
 
 
 def _run_elevated_startup_configuration(value: str) -> int:
@@ -1264,6 +1298,12 @@ def _run_elevated_startup_configuration(value: str) -> int:
 
 def main() -> int:
     argv = sys.argv[1:]
+    if "--legacy-ui" not in argv:
+        from campus_auth_desktop import main as desktop_main
+        return desktop_main(argv)
+    if len(argv) == 2 and argv[0] in ("--dorm-self-test", "--dorm-login-probe"):
+        from dorm_selftest import run
+        return run(argv[1], online_login=argv[0] == "--dorm-login-probe")
     for argument in argv:
         if argument.startswith("--configure-system-startup="):
             return _run_elevated_startup_configuration(argument.split("=", 1)[1])
