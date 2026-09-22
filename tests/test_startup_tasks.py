@@ -73,10 +73,48 @@ class ConfigureStartupTests(unittest.TestCase):
                 legacy_shortcut=shortcut,
             )
 
-            self.assertEqual([call[1] for call in calls], ["/Create", "/Create"])
+            self.assertEqual(
+                [call[1] for call in calls], ["/Create", "/Create", "/Run"]
+            )
             self.assertIn(SYSTEM_TASK_NAME, calls[0])
             self.assertIn(TRAY_TASK_NAME, calls[1])
+            self.assertIn(SYSTEM_TASK_NAME, calls[2])
             self.assertFalse(shortcut.exists())
+
+    def test_agent_start_failure_rolls_back_tasks_and_keeps_legacy_shortcut(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            shortcut = Path(temporary) / "youziauth.lnk"
+            shortcut.write_text("legacy", encoding="utf-8")
+            calls = []
+
+            def runner(arguments, **kwargs):
+                calls.append(arguments)
+                if arguments[1] == "/Run":
+                    raise subprocess.CalledProcessError(1, arguments)
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                configure_system_startup(
+                    True,
+                    Path(r"C:\Program Files\youziauth"),
+                    "S-1-5-21-1-2-3-1001",
+                    runner=runner,
+                    legacy_shortcut=shortcut,
+                )
+
+            self.assertTrue(shortcut.exists())
+            self.assertTrue(
+                any(
+                    call[1] == "/Delete" and SYSTEM_TASK_NAME in call
+                    for call in calls
+                )
+            )
+            self.assertTrue(
+                any(
+                    call[1] == "/Delete" and TRAY_TASK_NAME in call
+                    for call in calls
+                )
+            )
 
     def test_partial_enable_failure_rolls_back_and_keeps_legacy_shortcut(self):
         with tempfile.TemporaryDirectory() as temporary:

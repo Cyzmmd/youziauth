@@ -163,12 +163,18 @@ def configure_system_startup(
                 ["schtasks.exe", "/Create", "/TN", TRAY_TASK_NAME, "/XML", str(tray_xml), "/F"],
                 check=True,
             )
-        except Exception:
             _run_task_command(
                 runner,
-                ["schtasks.exe", "/Delete", "/TN", SYSTEM_TASK_NAME, "/F"],
-                check=False,
+                ["schtasks.exe", "/Run", "/TN", SYSTEM_TASK_NAME],
+                check=True,
             )
+        except Exception:
+            for task_name in (TRAY_TASK_NAME, SYSTEM_TASK_NAME):
+                _run_task_command(
+                    runner,
+                    ["schtasks.exe", "/Delete", "/TN", task_name, "/F"],
+                    check=False,
+                )
             raise
     legacy_shortcut.unlink(missing_ok=True)
 

@@ -56,12 +56,14 @@ youziauth 是一款面向西南大学校园网 ePortal 环境的 Windows 自动�
 
 ## 下载与安装
 
-1. 打开本仓库右侧的 **Releases** 页面；
-2. 进入最新版本，下载 `youziauth.msi`；
-3. 双击安装包并按照提示完成安装；
-4. 从 Windows 开始菜单启动 **youziauth**。
+1. 打开本仓库右侧的 **Releases** 页面，确认 Git Tag 与发布版本一致；
+2. 下载 `youziauth.msi`、`SHA256SUMS.txt` 和 `release-provenance.json`；
+3. 用 `Get-FileHash -Algorithm SHA256 .\youziauth.msi` 核对哈希；
+4. 用 `Get-AuthenticodeSignature .\youziauth.msi` 确认状态为 `Valid`，签名者与来源证明一致；
+5. 双击安装包并按照提示完成安装；
+6. 从 Windows 开始菜单启动 **youziauth**。
 
-安装过程中如果 Windows 显示安全确认，请先核对文件来源和 Release 页面提供的 SHA-256，再决定是否继续。
+安装过程中如果 Windows 显示安全确认，请停止并重新核对 Git Tag、SHA-256、数字签名和来源证明，不要直接绕过提示。
 
 ## 首次使用
 
@@ -144,6 +146,9 @@ service =
 - 打开设置，确认 **开机自启动** 已勾选并保存；
 - 如果保存时出现管理员授权窗口，请选择允许；
 - 在主界面点击 **检测一次**，先确认账号本身能够认证；
+- 如果状态显示“系统认证代理未运行”或日志长时间不更新，请点击 **修复系统代理** 并批准管理员提示；
+- 如果 Windows 安全中心显示对 `youziauth-agent.exe` 的检测，不要关闭 Defender，也不要排除整个安装目录。请先核对 GitHub Release 公布的数字签名和 SHA-256，再通过项目 Issue 和 Microsoft 文件分析入口报告误报；
+- 修复完成后确认状态时间和日志都已更新。只能看到旧日志并不代表后台代理仍在运行；
 - 如果使用手机热点或其他已经可以上网的连接，程序会主动跳过校园网认证。
 
 ### 关闭窗口后找不到程序

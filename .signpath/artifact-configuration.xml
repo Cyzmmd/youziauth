@@ -1,0 +1,16 @@
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <msi-file path="youziauth.msi" subject="youziauth" author="yoouzic">
+      <pe-file path="youziauth.exe" product-name="youziauth" product-version="${version}" file-version="${version}" company-name="yoouzic" original-filename="youziauth.exe">
+        <authenticode-sign description="youziauth campus network tray and settings" description-url="https://github.com/Cyzmmd/youziauth" />
+      </pe-file>
+      <pe-file path="youziauth-agent.exe" product-name="youziauth" product-version="${version}" file-version="${version}" company-name="yoouzic" original-filename="youziauth-agent.exe">
+        <authenticode-sign description="youziauth SYSTEM campus network authentication agent" description-url="https://github.com/Cyzmmd/youziauth" />
+      </pe-file>
+      <authenticode-sign description="youziauth Windows installer" description-url="https://github.com/Cyzmmd/youziauth" />
+    </msi-file>
+  </zip-file>
+</artifact-configuration>

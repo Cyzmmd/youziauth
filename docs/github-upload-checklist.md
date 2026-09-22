@@ -29,7 +29,9 @@ MSI 安装包只作为 GitHub Release 附件发布，不提交到源码仓库。
 
 - 版本号和主要变更；
 - `youziauth.msi`；
-- MSI 的 SHA-256；
+- `SHA256SUMS.txt` 和 `release-provenance.json`；
+- 有效且带可信时间戳的 MSI Authenticode 签名；
+- MSI 内 `youziauth.exe` 与 `youziauth-agent.exe` 的有效 Authenticode 签名；
 - 支持的 Windows 和 Python 版本；
 - 已知限制以及“非官方项目”声明。
 
@@ -43,3 +45,5 @@ MSI 安装包只作为 GitHub Release 附件发布，不提交到源码仓库。
 6. **已确认：** `assets/` 中的图片和图标由项目作者 `yoouzic` 生成并持有版权，随项目按 GPL-3.0-only 开源发布。
 7. 发布 MSI 前核对 Python、Tcl/Tk、PyInstaller、Pillow 等随安装包分发组件的许可证，并随 Release 提供必要的第三方版权与许可证说明。
 8. 使用 `git status` 和 `git diff --cached` 人工复核首次提交的每一个文件。
+9. 确认 Git Tag 与 `VERSION` 一致，且 Release 工作流发布的是 SignPath 返回的 `signed/youziauth.msi`，不是 `dist/youziauth.msi`。
+10. 下载 Release 附件复核签名发布者、时间戳、`SHA256SUMS.txt` 和 `release-provenance.json` 后再公开推广。
