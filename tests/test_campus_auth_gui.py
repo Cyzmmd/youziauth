@@ -292,6 +292,44 @@ class StartupOptionTests(unittest.TestCase):
             self.assertFalse(shortcut_path.exists())
             self.assertFalse(legacy_shortcut_path.exists())
 
+    def test_set_startup_enabled_waits_for_the_helper_and_verifies_the_state(self):
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks, "launch_elevated", return_value=0
+        ) as elevate, mock.patch.object(
+            campus_auth_gui.startup_tasks, "is_system_startup_enabled", return_value=True
+        ) as enabled:
+            campus_auth_gui.set_startup_enabled(True)
+
+        elevate.assert_called_once_with(["--configure-system-startup=enable"])
+        enabled.assert_called_once_with()
+
+    def test_a_failed_helper_exit_code_is_reported_instead_of_assumed_success(self):
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks, "launch_elevated", return_value=1
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                campus_auth_gui.set_startup_enabled(True)
+        self.assertIn("1", str(raised.exception))
+
+    def test_a_declined_uac_prompt_reaches_the_caller(self):
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks,
+            "launch_elevated",
+            side_effect=PermissionError("administrator approval was cancelled"),
+        ):
+            with self.assertRaises(PermissionError):
+                campus_auth_gui.set_startup_enabled(True)
+
+    def test_an_unverified_state_change_is_reported(self):
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks, "launch_elevated", return_value=0
+        ), mock.patch.object(
+            campus_auth_gui.startup_tasks, "is_system_startup_enabled", return_value=False
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                campus_auth_gui.set_startup_enabled(True)
+        self.assertIn("UAC", str(raised.exception))
+
 
 class LogTailTests(unittest.TestCase):
     def test_tail_log_returns_requested_recent_lines(self):
@@ -589,11 +627,27 @@ class AgentRepairTests(unittest.TestCase):
         app.agent_probe_in_flight = False
         app._set_status = mock.Mock()
         with mock.patch.object(
-            campus_auth_gui.startup_tasks, "relaunch_elevated_configuration"
+            campus_auth_gui.startup_tasks, "launch_elevated", return_value=0
         ) as elevate:
             app.repair_system_agent()
-        elevate.assert_called_once_with(True)
+        elevate.assert_called_once_with(["--configure-system-startup=enable"])
         self.assertIsNone(app.agent_ipc_ok)
+
+    def test_repair_reports_a_declined_uac_prompt(self):
+        app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
+        app.agent_mode = True
+        app.agent_ipc_ok = False
+        app.agent_probe_in_flight = False
+        app._set_status = mock.Mock()
+        with mock.patch.object(
+            campus_auth_gui.startup_tasks,
+            "launch_elevated",
+            side_effect=PermissionError("administrator approval was cancelled"),
+        ):
+            app.repair_system_agent()
+        status = app._set_status.call_args.args[0]
+        self.assertIn("修复系统代理失败", status)
+        self.assertIn("cancelled", status)
 
     def test_healthy_agent_start_does_not_claim_repair(self):
         app = campus_auth_gui.CampusAuthGui.__new__(campus_auth_gui.CampusAuthGui)
