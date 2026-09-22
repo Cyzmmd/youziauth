@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import re
 import threading
@@ -13,6 +14,14 @@ from pathlib import Path
 from windows_credentials import CredentialStore, DpapiProtector, atomic_write_bytes
 
 SHANGHAI = dt.timezone(dt.timedelta(hours=8))
+
+# A submission the school never recorded may be repeated, but only once the read-back says
+# the task is still unsigned. That keeps the write-ahead marker meaning what it says - an
+# unknown outcome stays readback-only - so a repeat can never duplicate a recorded check-in.
+SUBMIT_COOLDOWN_SECONDS = 60
+SUBMIT_MAX_ATTEMPTS = 3
+SUBMIT_EXHAUSTED_MESSAGE = (f'提交未生效，自动重试已达 {SUBMIT_MAX_ATTEMPTS} 次上限；'
+                            '请在学校页面核实或手动打卡')
 
 
 def now() -> dt.datetime:
@@ -154,7 +163,31 @@ class Store:
         self._write('pending.json', keys)
 
     def clear_pending(self, key):
-        self._write('pending.json', [k for k in self._pending_keys() if k != key])
+        keys = self._pending_keys()
+        if key in keys:
+            self._write('pending.json', [k for k in keys if k != key])
+
+    def _attempt_records(self):
+        value = self._read('submit-attempts.json', {})
+        if not isinstance(value, dict) or not all(
+                isinstance(key, str) and isinstance(record, dict)
+                and isinstance(record.get('count'), int) and isinstance(record.get('at'), (int, float))
+                for key, record in value.items()):
+            raise ValueError('提交尝试记录损坏')
+        return value
+
+    def attempts(self, key):
+        record = self._attempt_records().get(key) or {}
+        return record.get('count', 0), record.get('at', 0.0)
+
+    def record_attempt(self, key, at):
+        # Only today's task is ever retried, so an older entry is dropped instead of kept
+        # as a permanent record of every submission this machine has made.
+        self._write('submit-attempts.json', {key: {'count': self.attempts(key)[0] + 1, 'at': at}})
+
+    def clear_attempts(self, key):
+        if key in self._attempt_records():
+            self._write('submit-attempts.json', {})
 
     def record(self, result):
         self._write('status.json', dataclasses.asdict(result))
@@ -208,15 +241,22 @@ class Engine:
                 raise CheckinError('error', '任务账号与登录账号不一致，已停止')
             phase = task.phase(current)
             if task.signed:
-                if self.store.pending(task.key):
-                    self.store.clear_pending(task.key)
+                self.store.clear_pending(task.key)
+                self.store.clear_attempts(task.key)
                 return self._result('signed', '服务器已确认今日任务完成', task)
             if self.store.pending(task.key):
-                return self._readback(token, task)
+                settled = self._readback(token, task)
+                if settled is not None:
+                    return settled
+                # The school answered for this task and it is still unsigned, so the marker
+                # has done its job: nothing was recorded and a repeat cannot duplicate it.
             if phase != 'ready':
                 return self._result(phase, '任务尚未开始' if phase == 'waiting' else '任务已过期，未提交', task)
             if not submit:
                 return self._result('ready', '今日任务待完成，可提交打卡', task)
+            allowed, blocked_state, blocked_message = self._submission_allowed(task, current, automatic)
+            if not allowed:
+                return self._result(blocked_state, blocked_message, task)
             position = self.location()
             self._check_cancel()
             self.api.verify(token, task, position)
@@ -244,11 +284,23 @@ class Engine:
                 # No POST has been issued, so this marker is safe to remove.
                 self.store.clear_pending(task.key)
                 raise
+            self.store.record_attempt(task.key, int(current.timestamp()))
+            reason = None
             try:
-                self.api.submit(token, task, position)
+                recorded = self.api.submit(token, task, position) is True
+            except CheckinError as exc:
+                recorded, reason = False, exc
             except Exception:
-                pass  # Submission outcome is unknown until read-back; never retry the POST blindly.
-            return self._readback(token, task)
+                # The school's own words never reach the log; this stays a controlled message.
+                recorded, reason = False, CheckinError('error', '操作未完成，请检查网络、配置或稍后重试')
+            if recorded:
+                self.store.clear_pending(task.key)
+                self.store.clear_attempts(task.key)
+                return self._result('signed', '服务器已确认今日任务完成', task)
+            settled = self._readback(token, task)
+            if settled is not None:
+                return settled
+            return self._unrecorded(task, reason)
         except CheckinError as exc:
             return self._result(exc.state, str(exc), task)
         except Exception:
@@ -261,14 +313,43 @@ class Engine:
             raise CheckinError('cancelled', '操作已取消，未提交')
 
     def _readback(self, token, task):
+        """Settle a submission whose outcome was lost.
+
+        A Result means the question is answered or still unanswerable; None means the
+        school confirms this task is unsigned, so nothing was recorded, the marker is
+        cleared and a repeat submission can no longer create a duplicate.
+        """
         try:
             signed = self.api.is_signed(token, task)
         except Exception:
-            signed = False
+            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
         if signed:
             self.store.clear_pending(task.key)
+            self.store.clear_attempts(task.key)
             return self._result('signed', '服务器已确认今日任务完成', task)
-        return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
+        self.store.clear_pending(task.key)
+        return None
+
+    def _submission_allowed(self, task, current, automatic):
+        """Bound unattended repeats. A manual submission is never blocked: the user asked
+        for it, and every repeat still follows a read-back that rules out a duplicate."""
+        if not automatic:
+            return True, '', ''
+        count, last = self.store.attempts(task.key)
+        if count >= SUBMIT_MAX_ATTEMPTS:
+            return False, 'uncertain', SUBMIT_EXHAUSTED_MESSAGE
+        remaining = SUBMIT_COOLDOWN_SECONDS - (current.timestamp() - last)
+        if last and remaining > 0:
+            return False, 'ready', f'上次提交未生效，{math.ceil(remaining)} 秒后可重试；本次未提交'
+        return True, '', ''
+
+    def _unrecorded(self, task, reason):
+        """A repeatable failure: say what the school said, and that another try is coming."""
+        if reason is not None and reason.state in ('login_required', 'location_required'):
+            # These need the user, not another POST.
+            return self._result(reason.state, f'{reason}；本次提交未记录', task)
+        detail = f'{reason}；' if reason is not None else '服务器未记录本次提交；'
+        return self._result('ready', f'提交未生效：{detail}将在检查时段内重试', task)
 
     def _result(self, state, message, task=None):
         result = Result(state, message, task, self.clock().isoformat(timespec='seconds'))
