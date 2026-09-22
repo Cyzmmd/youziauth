@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
@@ -210,6 +211,7 @@ def is_system_startup_enabled(
 
 
 def relaunch_elevated_configuration(enabled: bool, executable: Path | None = None) -> int:
+    """Kept for callers that only need to request elevation, not observe it."""
     if os.name != "nt":
         raise OSError("system startup configuration is Windows-only")
     executable = Path(executable or sys.executable)
@@ -227,3 +229,69 @@ def relaunch_elevated_configuration(enabled: bool, executable: Path | None = Non
             raise PermissionError("administrator approval was cancelled")
         raise OSError(f"could not start elevated setup helper: ShellExecuteW={result}")
     return int(result)
+
+
+class _SHELLEXECUTEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("fMask", ctypes.c_ulong),
+        ("hwnd", ctypes.c_void_p),
+        ("lpVerb", ctypes.c_wchar_p),
+        ("lpFile", ctypes.c_wchar_p),
+        ("lpParameters", ctypes.c_wchar_p),
+        ("lpDirectory", ctypes.c_wchar_p),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", ctypes.c_void_p),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", ctypes.c_wchar_p),
+        ("hkeyClass", ctypes.c_void_p),
+        ("dwHotKey", ctypes.c_ulong),
+        ("hIcon", ctypes.c_void_p),
+        ("hProcess", ctypes.c_void_p),
+    ]
+
+
+def launch_elevated(
+    arguments: list[str],
+    executable: Path | None = None,
+    *,
+    timeout_seconds: float = 30.0,
+    wait_implementation: Callable[..., int] | None = None,
+) -> int:
+    """Run the executable elevated and return its exit code.
+
+    ShellExecuteW only reports that the UAC dialog was accepted; it never reports what the
+    helper did. ShellExecuteExW with a process wait makes the helper's result observable, so
+    a cancelled or failed elevation is reported instead of being mistaken for success.
+    """
+    if os.name != "nt":
+        raise OSError("system startup configuration is Windows-only")
+    executable = Path(executable or sys.executable)
+    wait_process = wait_implementation or ctypes.windll.kernel32.WaitForSingleObject
+    info = _SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(_SHELLEXECUTEINFOW)
+    info.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = str(executable)
+    info.lpParameters = subprocess.list2cmdline(arguments)
+    info.lpDirectory = str(executable.parent)
+    info.nShow = 0
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+        error = ctypes.get_last_error() or ctypes.windll.kernel32.GetLastError()
+        if error == 1223:  # ERROR_CANCELLED: the user declined the elevation prompt
+            raise PermissionError("administrator approval was cancelled")
+        raise OSError(f"could not start elevated setup helper: WinError={error}")
+    if not info.hProcess:
+        raise OSError("elevated setup helper started without a process handle")
+    try:
+        waited = wait_process(info.hProcess, int(timeout_seconds * 1000))
+        if waited == 0x00000102:  # WAIT_TIMEOUT
+            raise TimeoutError("elevated setup helper did not finish in time")
+        if waited != 0:
+            raise OSError(f"could not wait for the elevated setup helper: wait={waited}")
+        code = ctypes.c_ulong()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code)):
+            raise OSError("could not read the elevated setup helper exit code")
+        return int(code.value)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(info.hProcess)

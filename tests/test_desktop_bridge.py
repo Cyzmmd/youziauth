@@ -139,6 +139,45 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertFalse(self.bridge.dispatch('dorm_save', payload)['ok'])
         self.controller.save.assert_not_called()
 
+    def test_location_source_save_keeps_the_saved_schedule(self):
+        self.controller.store = Store(Path(self.tmp.name) / 'dorm')
+        self.controller.save.side_effect = self.controller.store.save_settings
+        self.controller.store.save_settings(Settings(enabled=True, start='22:00', end='23:00', interval=600))
+        result = self.bridge.dispatch('location_source_save', {'location_source': 'simulation'})
+        self.assertTrue(result['ok'], result['message'])
+        saved = self.controller.store.settings()
+        self.assertEqual(saved.location_source, 'simulation')
+        self.assertEqual((saved.enabled, saved.start, saved.end, saved.interval),
+                         (True, '22:00', '23:00', 600))
+        self.assertEqual(self.bridge.snapshot()['location']['state'], 'idle')
+
+    def test_location_source_save_rejects_unknown_sources(self):
+        self.controller.store = Store(Path(self.tmp.name) / 'dorm')
+        self.controller.save.side_effect = self.controller.store.save_settings
+        self.assertFalse(self.bridge.dispatch('location_source_save', {'location_source': 'unknown'})['ok'])
+        self.controller.save.assert_not_called()
+        self.assertEqual(self.controller.store.settings().location_source, 'windows')
+
+    def test_location_source_save_is_rejected_while_a_probe_runs(self):
+        self.bridge._location_gate.acquire()
+        try:
+            self.assertFalse(self.bridge.dispatch('location_source_save', {'location_source': 'simulation'})['ok'])
+            self.controller.save.assert_not_called()
+        finally:
+            self.bridge._location_gate.release()
+
+    def test_preview_location_source_save_switches_without_touching_the_schedule(self):
+        preview = PreviewBridge()
+        payload = dict(enabled=False, start='21:00', end='23:30', interval=300, location_source='windows')
+        self.assertTrue(preview.dispatch('dorm_save', payload)['ok'])
+        self.assertTrue(preview.dispatch('location_source_save', {'location_source': 'simulation'})['ok'])
+        settings = preview.snapshot()['dorm']['settings']
+        self.assertEqual(settings['location_source'], 'simulation')
+        self.assertEqual(settings['interval'], 300)
+        self.assertIn('模拟', preview.snapshot()['location']['message'])
+        self.assertFalse(preview.dispatch('location_source_save', {'location_source': 'unknown'})['ok'])
+        self.assertEqual(preview.snapshot()['dorm']['settings']['location_source'], 'simulation')
+
     def test_valid_save_can_recover_corrupt_settings(self):
         self.controller.store = Store(Path(self.tmp.name))
         self.controller.save.side_effect = self.controller.store.save_settings

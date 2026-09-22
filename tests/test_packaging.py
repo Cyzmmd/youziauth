@@ -137,6 +137,65 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("ProtocolRegistrationComponent", source)
 
 
+class PayloadCompletenessTests(unittest.TestCase):
+    """1.4.0 shipped an MSI whose running processes made Windows Installer defer 41
+    file copies (including _internal\\base_library.zip) to the next reboot, so the
+    installed app died with "Failed to import encodings module"."""
+
+    def test_wix_source_stops_running_processes_before_install_validate(self):
+        source = ROOT.joinpath("packaging", "youziauth.wxs").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("StopYouziauthProcesses", source)
+        self.assertIn('Before="InstallValidate"', source)
+        self.assertIn("taskkill", source)
+        self.assertIn("youziauth-agent.exe", source)
+        self.assertIn("youziauth.exe", source)
+        self.assertIn('Condition="NOT REMOVE"', source)
+
+    def test_build_script_verifies_the_wix_manifest_and_can_verify_the_payload(self):
+        script = ROOT.joinpath("build_msi.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Assert-WixManifestIsComplete", script)
+        self.assertIn("verify_msi_payload.ps1", script)
+        self.assertIn("[switch]$VerifyPayload", script)
+        self.assertIn("ApplicationFiles.wxs", script)
+
+    def test_payload_verifier_compares_every_bundle_file(self):
+        verifier = ROOT.joinpath(
+            "packaging", "verify_msi_payload.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("'/a'", verifier)
+        self.assertIn("base_library", verifier)
+        self.assertIn("PFiles", verifier)
+        self.assertIn("Get-ChildItem -LiteralPath $AppDir -Recurse -File", verifier)
+
+    def test_release_workflow_verifies_the_payload_before_signing(self):
+        text = ROOT.joinpath(".github", "workflows", "release.yml").read_text(
+            encoding="utf-8"
+        )
+        build = text.index("Build unsigned MSI")
+        sign = text.index("Submit SignPath request")
+        self.assertIn("-VerifyPayload", text)
+        self.assertLess(build, sign)
+
+    def test_pyinstaller_bundle_keeps_the_interpreter_standard_library(self):
+        # The frozen interpreter cannot start without base_library.zip; it must stay
+        # inside the PyInstaller build tree that feeds the WiX manifest.
+        spec = ROOT.joinpath("packaging", "youziauth.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("COLLECT", spec)
+        self.assertIn('name="youziauth"', spec)
+        manifest = ROOT.joinpath("build", "wix", "ApplicationFiles.wxs")
+        if manifest.exists():
+            text = manifest.read_text(encoding="utf-8")
+            self.assertIn("base_library.zip", text)
+
+
 class ReleaseMetadataTests(unittest.TestCase):
     def test_version_file_is_strict_semver(self):
         version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
@@ -144,10 +203,12 @@ class ReleaseMetadataTests(unittest.TestCase):
 
     def test_version_is_ahead_of_the_last_shipped_msi(self):
         # Windows refuses to install at or below an installed version, so a VERSION
-        # that lags a shipped build produces an uninstallable MSI.
+        # that lags a shipped build produces an uninstallable MSI. 1.4.0 shipped with a
+        # payload defect, 1.4.1 carried the payload fix and 1.4.2 the location-source
+        # selector, so this build must be strictly newer than all of them.
         version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
         shipped = tuple(int(part) for part in version.split("."))
-        self.assertGreater(shipped, (1, 3, 1))
+        self.assertGreater(shipped, (1, 4, 2))
 
     def test_wix_version_comes_from_build_variable(self):
         source = ROOT.joinpath("packaging", "youziauth.wxs").read_text(

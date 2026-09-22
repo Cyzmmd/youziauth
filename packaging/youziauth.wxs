@@ -11,6 +11,29 @@
     <Icon Id="YuzuAppIcon" SourceFile="assets\yuzu_app.ico" />
     <Property Id="ARPPRODUCTICON" Value="YuzuAppIcon" />
 
+    <Launch
+      Condition="Installed OR (VersionNT &gt;= 603)"
+      Message="youziauth requires Windows 8.1 or later." />
+
+    <!-- The tray application and the SYSTEM agent hold python314.dll, VCRUNTIME140.dll
+         and base_library.zip open. Windows Installer then defers exactly those file
+         copies to the next reboot, and a user who launches the installed app before
+         that reboot gets "Failed to start embedded python interpreter: Failed to
+         import encodings module" because base_library.zip never landed on disk.
+         Stop both processes before InstallValidate so every payload file is written
+         during this transaction and no reboot is required. The second pass catches a
+         process the first taskkill raced with. -->
+    <CustomAction
+      Id="StopYouziauthProcesses"
+      Directory="SystemFolder"
+      ExeCommand="cmd.exe /c taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul &amp; taskkill /f /t /im youziauth-agent.exe &gt;nul 2&gt;nul &amp; taskkill /f /t /im youziauth.exe &gt;nul 2&gt;nul &amp; ping -n 2 127.0.0.1 &gt;nul"
+      Execute="immediate"
+      Impersonate="no"
+      Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="StopYouziauthProcesses" Before="InstallValidate" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+
     <StandardDirectory Id="ProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="youziauth" />
     </StandardDirectory>

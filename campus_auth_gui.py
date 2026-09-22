@@ -442,7 +442,17 @@ def _ps_quote(value: Path | str) -> str:
 
 def set_startup_enabled(enabled: bool, shortcut_path: Optional[Path] = None) -> None:
     if shortcut_path is None:
-        startup_tasks.relaunch_elevated_configuration(enabled)
+        # Wait for the elevated helper so its exit code can be reported. A declined UAC
+        # prompt or a failed schtasks run must surface as an error, not as an assumed success.
+        code = startup_tasks.launch_elevated(
+            ["--configure-system-startup=" + ("enable" if enabled else "disable")]
+        )
+        if code != 0:
+            raise RuntimeError("开机自启动配置失败（提权助手退出码 %d），请重试。" % code)
+        if startup_tasks.is_system_startup_enabled() != enabled:
+            raise RuntimeError(
+                "开机自启动状态未生效：管理员授权可能被取消，请在 UAC 提示中选择“是”后重试。"
+            )
         return
     for legacy_path in legacy_startup_shortcut_paths(shortcut_path):
         if legacy_path.exists():
@@ -692,7 +702,9 @@ class CampusAuthGui:
 
     def repair_system_agent(self) -> None:
         try:
-            startup_tasks.relaunch_elevated_configuration(True)
+            code = startup_tasks.launch_elevated(["--configure-system-startup=enable"])
+            if code != 0:
+                raise RuntimeError("提权助手退出码 %d" % code)
         except Exception as exc:  # noqa: BLE001 - report UAC/setup failures in the UI.
             self._set_status(
                 f"修复系统代理失败：{exc}", windows_tray.TrayStatus.ERROR

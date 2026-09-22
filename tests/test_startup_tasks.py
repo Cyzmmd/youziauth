@@ -3,7 +3,9 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
+import startup_tasks
 from startup_tasks import (
     SYSTEM_TASK_NAME,
     TRAY_TASK_NAME,
@@ -158,6 +160,67 @@ class EnabledStateTests(unittest.TestCase):
             return subprocess.CompletedProcess(arguments, 1, "", "not found")
 
         self.assertFalse(is_system_startup_enabled(runner=runner))
+
+
+class ElevatedLaunchTests(unittest.TestCase):
+    """ShellExecuteW hid the UAC outcome; launch_elevated must report it (1.4.2 regression)."""
+
+    def setUp(self):
+        self.calls = []
+        self.kernel = mock.Mock()
+        self.process = 4242
+        self.shell_result = 1
+        self.exit_code = 0
+
+        def shell_execute_ex_w(pointer):
+            self.calls.append(pointer._obj)
+            if self.shell_result:
+                pointer._obj.hProcess = self.process
+            return self.shell_result
+
+        def get_exit_code_process(handle, pointer):
+            pointer._obj.value = self.exit_code
+            return 1
+
+        self.kernel.WaitForSingleObject.return_value = 0
+        self.kernel.GetExitCodeProcess.side_effect = get_exit_code_process
+        self.kernel.GetLastError.return_value = 0
+        fakes = mock.Mock()
+        fakes.shell32.ShellExecuteExW.side_effect = shell_execute_ex_w
+        fakes.kernel32 = self.kernel
+        patch = mock.patch.object(startup_tasks.ctypes, "windll", fakes)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_runs_the_helper_with_runas_and_returns_its_exit_code(self):
+        code = startup_tasks.launch_elevated(["--configure-system-startup=enable"])
+        self.assertEqual(code, 0)
+        info = self.calls[0]
+        self.assertEqual(info.lpVerb, "runas")
+        self.assertIn("--configure-system-startup=enable", info.lpParameters)
+        self.assertEqual(info.fMask, 0x40)
+        self.kernel.CloseHandle.assert_called_once_with(self.process)
+
+    def test_helper_failure_exit_code_reaches_the_caller(self):
+        self.exit_code = 1
+        self.assertEqual(startup_tasks.launch_elevated(["--configure-system-startup=enable"]), 1)
+
+    def test_a_declined_uac_prompt_is_reported_as_permission_error(self):
+        self.shell_result = 0
+        self.kernel.GetLastError.return_value = 1223
+        with self.assertRaises(PermissionError):
+            startup_tasks.launch_elevated(["--configure-system-startup=enable"])
+
+    def test_an_unexpected_shell_error_is_reported(self):
+        self.shell_result = 0
+        self.kernel.GetLastError.return_value = 5
+        with self.assertRaises(OSError):
+            startup_tasks.launch_elevated(["--configure-system-startup=enable"])
+
+    def test_a_helper_that_never_finishes_times_out(self):
+        self.kernel.WaitForSingleObject.return_value = 0x102
+        with self.assertRaises(TimeoutError):
+            startup_tasks.launch_elevated(["--configure-system-startup=enable"], timeout_seconds=1)
 
 
 if __name__ == "__main__":
