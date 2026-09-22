@@ -1,6 +1,7 @@
 param(
     [string]$PythonPath = "",
-    [switch]$InstallDependencies
+    [switch]$InstallDependencies,
+    [switch]$VerifyPayload
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +44,27 @@ function Ensure-PythonBuildDependencies {
     if ($LASTEXITCODE -ne 0) {
         throw "Pinned Python build dependencies are unavailable"
     }
+}
+
+function Assert-WixManifestIsComplete {
+    param([string]$ManifestPath, [string]$AppDir)
+    # The generated manifest is the whole payload contract. A bundle file that never
+    # reaches ApplicationFiles.wxs ships an interpreter without its standard library,
+    # which fails at startup with "Failed to import encodings module".
+    $expected = New-Object System.Collections.Generic.List[string]
+    foreach ($item in Get-ChildItem -LiteralPath $AppDir -Recurse -File -Force) {
+        $expected.Add($item.FullName)
+    }
+    $listed = @{}
+    foreach ($match in [regex]::Matches((Get-Content -LiteralPath $ManifestPath -Raw), 'Source="([^"]+)"')) {
+        $listed[$match.Groups[1].Value] = $true
+    }
+    $missing = @($expected | Where-Object { -not $listed.ContainsKey($_) })
+    if ($missing.Count -gt 0) {
+        $missing | Select-Object -First 20 | ForEach-Object { Write-Host "  NOT IN MANIFEST  $_" }
+        throw "$($missing.Count) bundle files are missing from the WiX file manifest"
+    }
+    Write-Host "WiX manifest covers all $($expected.Count) bundle files"
 }
 
 function Resolve-Wix {
@@ -124,6 +146,7 @@ $GeneratedWxs = Join-Path $WixBuildDir "ApplicationFiles.wxs"
 if ($LASTEXITCODE -ne 0) {
     throw "WiX file manifest generation failed"
 }
+Assert-WixManifestIsComplete -ManifestPath $GeneratedWxs -AppDir $AppDir
 
 & $Wix --acceptEula wix7 build `
     (Join-Path $PackagingDir "youziauth.wxs") `
@@ -135,6 +158,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 if (-not (Test-Path -LiteralPath $MsiPath)) {
     throw "WiX completed without producing $MsiPath"
+}
+
+if ($VerifyPayload) {
+    & (Join-Path $PackagingDir "verify_msi_payload.ps1") -MsiPath $MsiPath -AppDir $AppDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "MSI payload verification failed"
+    }
 }
 
 Write-Host "MSI created: $MsiPath"

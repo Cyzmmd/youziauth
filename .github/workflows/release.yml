@@ -34,7 +34,7 @@ jobs:
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build unsigned MSI
         shell: powershell
-        run: .\build_msi.ps1 -InstallDependencies
+        run: .\build_msi.ps1 -InstallDependencies -VerifyPayload
       - name: Upload unsigned MSI for SignPath
         id: upload-unsigned
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

@@ -26,7 +26,7 @@ jobs:
         run: python -m compileall -q .
       - name: Build MSI
         shell: powershell
-        run: .\build_msi.ps1 -InstallDependencies
+        run: .\build_msi.ps1 -InstallDependencies -VerifyPayload
       - name: Upload unsigned audit artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
