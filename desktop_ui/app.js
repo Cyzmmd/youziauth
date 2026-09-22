@@ -52,7 +52,7 @@ function render() {
   $('preview-tag').textContent = state.location_diagnostic ? '真实定位诊断 · 其他功能为演示' : '演示预览';
   badge('location-source-badge',simulation?'当前来源 · 模拟定位（非实时）':'当前来源 · 真实定位（Windows）',simulation?'warning':'');
   $('location-mode-hint').textContent=simulation
-    ? '使用已保存样本中的固定采样位置，并非当前位置；无需 Windows 定位授权。'
+    ? '使用已保存样本附近每次随机偏移的位置，并非当前位置；无需 Windows 定位授权。'
     : '实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。';
   $('location-submit-hint').textContent=simulation
     ? '提交时会向学校发送登录凭据、任务字段及已保存的模拟位置（非实时）。仍须通过学校验证，学校仍可拒绝。'
@@ -156,7 +156,7 @@ $('submit-dorm').onclick=()=>{
   const text=recheck
     ? '仅向学校查询已有提交结果，不会重新提交打卡，也不会读取或发送新的位置坐标。'
     : (source==='simulation'
-      ? '将使用已保存的模拟位置（固定采样位置，非实时，并非当前位置），向学校发送登录凭据、任务字段和该位置。'
+      ? '将使用已保存的模拟位置（样本附近的随机偏移，非实时，并非当前位置），向学校发送登录凭据、任务字段和该位置。'
       : '将使用 Windows 实时定位，向学校发送登录凭据、任务字段和位置。')+'仍须通过学校验证，学校仍可拒绝。提交后会回查学校结果。';
   confirmAction(recheck?'回查提交结果？':'提交今日打卡？',text,()=>{
     if(!requireSavedLocationSource())return;

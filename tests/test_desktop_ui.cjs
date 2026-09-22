@@ -232,7 +232,8 @@ test('simulation detection is clearly non-live and requires no Windows permissio
   assert.equal(h.el('authorize-location').textContent,'检测模拟定位');
   assert.match(h.el('location-source-badge').textContent,/模拟/);
   assert.equal(h.el('location-source-badge').className,'badge warning');
-  assert.match(h.el('location-mode-hint').textContent,/固定采样位置/);
+  assert.match(h.el('location-mode-hint').textContent,/随机偏移/);
+  assert.doesNotMatch(h.el('location-mode-hint').textContent,/固定采样位置/);
   assert.match(h.el('location-mode-hint').textContent,/并非当前位置/);
   assert.match(h.el('location-mode-hint').textContent,/无需 Windows.*授权/);
   assert.match(h.el('location-submit-hint').textContent,/学校.*拒绝/);
