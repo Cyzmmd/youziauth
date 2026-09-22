@@ -33,7 +33,7 @@
           <article class="paper-card summary"><div class="card-label"><span><i class="bi bi-wifi" aria-hidden="true"></i> 校园网连接</span><span id="network-badge" class="badge">等待检测</span></div><h2 id="network-headline">尚未检测</h2><p class="muted" id="network-summary">正在读取状态…</p><a href="#network" class="card-link">连接与设置 <i class="bi bi-arrow-up-right" aria-hidden="true"></i></a></article>
           <article class="paper-card summary"><div class="card-label"><span><i class="bi bi-journal-check" aria-hidden="true"></i> 今日寝室打卡</span><span id="dorm-badge" class="badge">待查询</span></div><h2 id="dorm-headline">查看今日安排</h2><p class="muted" id="dorm-summary">正在读取状态…</p><a href="#dorm" class="card-link">前往寝室打卡 <i class="bi bi-arrow-up-right" aria-hidden="true"></i></a></article>
         </div>
-        <div class="bottom-grid"><article class="paper-card compact"><h3><i class="bi bi-sliders" aria-hidden="true"></i> 后台安排</h3><div class="info-row"><span>校园网自动检测</span><strong id="monitor-summary">未开启</strong></div><div class="info-row"><span>寝室自动打卡</span><strong id="auto-summary">未开启</strong></div></article><article class="paper-card compact"><h3><i class="bi bi-arrow-up-right-circle" aria-hidden="true"></i> 快捷入口</h3><a class="quick-link" href="#network">管理校园网账号 <i class="bi bi-chevron-right" aria-hidden="true"></i></a><a class="quick-link" href="#records">查看最近运行记录 <i class="bi bi-chevron-right" aria-hidden="true"></i></a></article></div>
+        <div class="bottom-grid"><article class="paper-card compact"><h3><i class="bi bi-sliders" aria-hidden="true"></i> 后台安排</h3><div class="info-row"><span>校园网自动检测</span><strong id="monitor-summary">未开启</strong></div><div class="info-row"><span>寝室自动打卡</span><strong id="auto-summary">未开启</strong></div><div class="info-row"><span>打卡定位来源</span><strong id="overview-location-source">真实定位（Windows）</strong></div></article><article class="paper-card compact"><h3><i class="bi bi-arrow-up-right-circle" aria-hidden="true"></i> 快捷入口</h3><a class="quick-link" href="#network">管理校园网账号 <i class="bi bi-chevron-right" aria-hidden="true"></i></a><a class="quick-link" href="#records">查看最近运行记录 <i class="bi bi-chevron-right" aria-hidden="true"></i></a></article></div>
       </section>
 
       <section class="page" id="network" aria-labelledby="network-title" hidden>
@@ -53,24 +53,22 @@
             <div class="time-fields"><div><label for="auto-start">开始时间</label><input id="auto-start" type="time" value="21:00" required></div><span>至</span><div><label for="auto-end">结束时间</label><input id="auto-end" type="time" value="23:30" required></div></div>
             <div class="setting-row"><div><label for="auto-interval">检查间隔</label><p class="field-hint">60–3600 秒</p></div><div class="number-field"><input id="auto-interval" type="number" min="60" max="3600" value="300" required><span>秒</span></div></div>
             <p class="schedule" id="schedule">自动打卡：关闭</p>
-            <div class="location-source-settings">
-              <label for="location-source">全局定位来源</label>
-              <select id="location-source" name="location_source" aria-describedby="location-source-scope" required>
-                <option value="windows">真实定位（Windows / Wi-Fi）</option>
-                <option value="simulation">模拟定位（已保存样本）</option>
-              </select>
-              <p class="field-hint" id="location-source-scope">保存后全局生效：定位检测、手动提交和自动打卡。默认真实定位，重启后保留已保存的选择。</p>
-            </div>
             <div class="form-footer"><span class="form-state" id="dorm-save-state">设置已同步</span><button type="submit" class="primary">保存打卡设置</button></div>
           </form>
-          <aside class="side-stack"><article class="paper-card compact">
-            <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 关于定位与登录</h3>
-            <span class="badge" id="location-source-badge" aria-live="polite">当前来源 · 真实定位（Windows）</span>
+          <aside class="side-stack">
+            <article class="paper-card compact location-source-card">
+            <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 定位来源与登录</h3>
+            <label for="location-source">选择定位来源</label>
+            <select id="location-source" name="location_source" aria-describedby="location-source-scope" required>
+              <option value="windows">真实定位（Windows / Wi-Fi）</option>
+              <option value="simulation">模拟定位（已保存样本）</option>
+            </select>
+            <p class="field-hint" id="location-source-scope">保存后立即全局生效：定位检测、手动提交和自动打卡。重启后保留已保存的选择。</p>
+            <button class="primary full" id="save-location-source" type="button">保存定位来源</button>
+            <span class="badge full" id="location-source-badge" aria-live="polite">当前来源 · 真实定位（Windows）</span>
             <div class="location-check" aria-live="polite"><p id="location-message">点击下方按钮请求系统授权并检测实时定位，不会提交打卡。</p><small id="location-checked">仅检测定位，不会提交打卡</small></div>
             <button class="primary full" id="authorize-location" data-action="location_authorize">授权并检测定位</button>
-            <p class="field-hint" id="location-mode-hint">实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
-            <p class="muted small" id="location-submit-hint">提交时会向学校发送登录凭据、任务字段及 Windows 实时位置。位置不可用或精度不足时停止，仍须通过学校验证。</p>
-            <p class="muted small">自动执行需电脑开机、登录 Windows，并保持软件运行；实际提交仍须在学校任务时段内。</p>
+            <p class="field-hint" id="location-mode-hint" hidden>实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
             <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button>
           </article></aside>
         </div>

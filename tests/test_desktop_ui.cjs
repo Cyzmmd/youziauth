@@ -24,6 +24,9 @@ function harness(source='windows'){
     if(id)elements.set(id,element);
     if(action)actions.push(element);
   }
+  const saveSource={id:'save-location-source',tagName:'BUTTON',disabled:false,textContent:'保存定位来源',
+    listeners:{},addEventListener(event,fn){this.listeners[event]=fn;},focus(){},dataset:{}};
+  elements.set('save-location-source',saveSource);
   for(const select of html.matchAll(/<select\b[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<\/select>/g)){
     const element=elements.get(select[1]);
     element.options=[...select[2].matchAll(/<option\b[^>]*value="([^"]+)"[^>]*>([^<]*)<\/option>/g)].map(o=>({value:o[1],text:o[2]}));
@@ -36,6 +39,7 @@ function harness(source='windows'){
   const api={snapshot:async()=>structuredClone(data),dispatch:async(action,payload)=>{
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
+    if(action==='location_source_save')data.dorm.settings.location_source=payload.location_source;
     return {ok:true,message:'操作完成'};
   }};
   const context=vm.createContext({console,URLSearchParams,Intl,Date,Promise,
@@ -44,15 +48,17 @@ function harness(source='windows'){
     document:{getElementById:id=>elements.get(id)||null,querySelectorAll:selector=>{
       if(selector==='[data-action]')return actions;
       const selected=[...selector.matchAll(/\[data-action="([^"]+)"\]/g)].map(m=>m[1]);
-      return actions.filter(button=>selected.includes(button.dataset.action));
+      if(selected.length)return actions.filter(button=>selected.includes(button.dataset.action));
+      const ids=[...selector.matchAll(/#([\w-]+)/g)].map(m=>m[1]);
+      return ids.map(id=>elements.get(id)).filter(Boolean);
     }},
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../desktop_ui/app.js'),'utf8'),context);
   return {el,data,api,calls,context,stop,refresh:()=>vm.runInContext('refresh()',context)};
 }
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
-function selectSource(h,source){h.el('location-source').value=source;h.el('dorm-form').listeners.input();}
-const saveDorm=h=>h.el('dorm-form').listeners.submit({preventDefault(){}});
+function pickSource(h,source){h.el('location-source').value=source;h.el('location-source').listeners.change();}function saveSource(h){return h.el('save-location-source').listeners.click();}
+function saveSchedule(h){return h.el('dorm-form').listeners.submit({preventDefault(){}});}
 
 test('unsaved network form does not block stopping an active monitor',async()=>{
   const h=harness();await settle();
@@ -109,6 +115,24 @@ test('a successful network save without a snapshot preserves the draft and passw
   assert.match(h.el('toast').textContent,/操作已执行.*尚未同步/);
 });
 
+test('a startup change warns that Windows will ask for administrator approval',async()=>{
+  const h=harness();await settle();
+  let complete;
+  h.api.dispatch=(action,payload)=>new Promise(resolve=>complete=()=>resolve({ok:true,message:'操作完成'}));
+  h.el('startup').checked=true;
+  const saving=h.el('network-form').listeners.submit({preventDefault(){}});
+  assert.match(h.el('toast').textContent,/管理员授权/);
+  complete();await saving;
+});
+
+test('saving without a startup change does not claim a UAC prompt',async()=>{
+  const h=harness();await settle();
+  h.el('username').value='student';
+  h.el('network-form').listeners.input();
+  await h.el('network-form').listeners.submit({preventDefault(){}});
+  assert.doesNotMatch(h.el('toast').textContent,/管理员授权/);
+});
+
 test('location actions wait for the first snapshot',async()=>{
   const h=harness();
   h.el('authorize-location').listeners.click();h.el('submit-dorm').onclick();
@@ -131,20 +155,41 @@ test('native location select restores the saved source without performing action
   assert.equal(select.value,'windows');
 });
 
-test('saving simulation sends the source and the four existing schedule fields only',async()=>{
+test('saving the source sends only the source and keeps the schedule untouched',async()=>{
   const h=harness();await settle();
-  selectSource(h,'simulation');await saveDorm(h);
+  pickSource(h,'simulation');await saveSource(h);
   assert.equal(h.calls.length,1);
-  assert.equal(h.calls[0].action,'dorm_save');
-  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].payload)),{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:'simulation'});
+  assert.equal(h.calls[0].action,'location_source_save');
+  assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].payload)),{location_source:'simulation'});
   assert.equal(h.el('location-source').value,'simulation');
   assert.equal(h.el('dorm-save-state').textContent,'设置已同步');
   assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
 });
 
+test('saving the schedule alone never rewrites the saved location source',async()=>{
+  const h=harness('simulation');await settle();
+  h.el('auto-interval').value='600';h.el('dorm-form').listeners.input();
+  await saveSchedule(h);
+  assert.equal(h.calls.length,1);
+  assert.equal(h.calls[0].action,'dorm_save');
+  assert.equal('location_source' in h.calls[0].payload,false);
+  assert.equal(h.data.dorm.settings.location_source,'simulation');
+  assert.match(h.el('location-source-badge').textContent,/模拟/);
+});
+
+test('the source save button stays idle until the draft differs from the saved source',async()=>{
+  const h=harness();await settle();
+  assert.equal(h.el('save-location-source').disabled,true);
+  pickSource(h,'simulation');await h.refresh();
+  assert.equal(h.el('save-location-source').disabled,false);
+  assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
+  pickSource(h,'windows');await h.refresh();
+  assert.equal(h.el('save-location-source').disabled,true);
+});
 test('refresh preserves a source draft but labels and detection use the saved source',async()=>{
   const h=harness();await settle();
-  selectSource(h,'simulation');await h.refresh();
+  pickSource(h,'simulation');await h.refresh();
   assert.equal(h.el('location-source').value,'simulation');
   assert.match(h.el('location-source-badge').textContent,/真实.*Windows/);
   assert.equal(h.el('authorize-location').textContent,'授权并检测定位');
@@ -154,9 +199,9 @@ test('refresh preserves a source draft but labels and detection use the saved so
 test('a source edit during save survives and the accepted source drives the label',async()=>{
   const h=harness();await settle();
   let complete;
-  h.api.dispatch=(action,payload)=>new Promise(resolve=>{complete=()=>{Object.assign(h.data.dorm.settings,payload);resolve({ok:true,message:'saved'});};});
-  selectSource(h,'simulation');const saving=saveDorm(h);
-  selectSource(h,'windows');complete();await saving;
+  h.api.dispatch=(action,payload)=>new Promise(resolve=>{complete=()=>{h.data.dorm.settings.location_source=payload.location_source;resolve({ok:true,message:'saved'});};});
+  pickSource(h,'simulation');const saving=saveSource(h);
+  pickSource(h,'windows');complete();await saving;
   assert.equal(h.el('location-source').value,'windows');
   assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
   assert.match(h.el('location-source-badge').textContent,/模拟/);
@@ -167,7 +212,7 @@ test('a source edit during save survives and the accepted source drives the labe
 test('failed source save keeps the draft while the saved source remains real',async()=>{
   const h=harness();await settle();
   h.api.dispatch=async()=>({ok:false,message:'failed'});
-  selectSource(h,'simulation');await saveDorm(h);
+  pickSource(h,'simulation');await saveSource(h);
   assert.equal(h.el('location-source').value,'simulation');
   assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
   assert.match(h.el('location-source-badge').textContent,/真实/);
@@ -178,14 +223,14 @@ test('saved simulation stays dirty and blocks location actions until its snapsho
   h.data.dorm.state='ready';await h.refresh();
   const snapshot=h.api.snapshot;
   h.api.snapshot=async()=>{throw Error('snapshot unavailable');};
-  selectSource(h,'simulation');await saveDorm(h);
-  assert.deepEqual(h.calls.map(call=>call.action),['dorm_save']);
+  pickSource(h,'simulation');await saveSource(h);
+  assert.deepEqual(h.calls.map(call=>call.action),['location_source_save']);
   assert.equal(h.el('location-source').value,'simulation');
   assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
   assert.equal(h.el('connection-error').hidden,false);
   assert.match(h.el('toast').textContent,/操作已执行.*尚未同步/);
   h.el('authorize-location').listeners.click();h.el('submit-dorm').onclick();await settle();
-  assert.deepEqual(h.calls.map(call=>call.action),['dorm_save']);
+  assert.deepEqual(h.calls.map(call=>call.action),['location_source_save']);
   assert.equal(h.el('confirm-dialog').open,false);
   assert.equal(h.el('authorize-location').disabled,true);
   assert.equal(h.el('submit-dorm').disabled,true);
@@ -197,12 +242,12 @@ test('saved simulation stays dirty and blocks location actions until its snapsho
   assert.match(h.el('location-source-badge').textContent,/模拟/);
   assert.equal(h.el('authorize-location').disabled,false);
   assert.equal(h.el('submit-dorm').disabled,false);
-  assert.deepEqual(h.calls.map(call=>call.action),['dorm_save']);
+  assert.deepEqual(h.calls.map(call=>call.action),['location_source_save']);
   h.el('authorize-location').listeners.click();await settle();
   h.el('submit-dorm').onclick();
   assert.match(h.el('confirm-text').textContent,/已保存的模拟位置/);
   h.el('confirm-ok').onclick();await settle();
-  assert.deepEqual(h.calls.map(call=>call.action),['dorm_save','location_authorize','dorm_submit']);
+  assert.deepEqual(h.calls.map(call=>call.action),['location_source_save','location_authorize','dorm_submit']);
 });
 
 test('a failed snapshot blocks even a matching source and recovery reads the real saved source',async()=>{
@@ -231,13 +276,9 @@ test('simulation detection is clearly non-live and requires no Windows permissio
   const h=harness('simulation');await settle();
   assert.equal(h.el('authorize-location').textContent,'检测模拟定位');
   assert.match(h.el('location-source-badge').textContent,/模拟/);
-  assert.equal(h.el('location-source-badge').className,'badge warning');
-  assert.match(h.el('location-mode-hint').textContent,/随机偏移/);
-  assert.doesNotMatch(h.el('location-mode-hint').textContent,/固定采样位置/);
-  assert.match(h.el('location-mode-hint').textContent,/并非当前位置/);
-  assert.match(h.el('location-mode-hint').textContent,/无需 Windows.*授权/);
-  assert.match(h.el('location-submit-hint').textContent,/学校.*拒绝/);
-  assert.match(h.el('location-submit-hint').textContent,/学校验证/);
+  assert.equal(h.el('location-source-badge').className,'badge full warning');
+  // 冗长的模拟定位说明已移除：模拟模式下不再显示任何模式说明文字。
+  assert.equal(h.el('location-mode-hint').hidden,true);
   h.el('authorize-location').listeners.click();await settle();
   assert.equal(h.calls[0]?.action,'location_authorize');
   assert.match(h.el('toast').textContent,/模拟.*非实时/);
@@ -253,21 +294,30 @@ test('simulation detection is clearly non-live and requires no Windows permissio
 
 test('saving Windows restores real detection and explains Windows chooses the source',async()=>{
   const h=harness('simulation');await settle();
-  selectSource(h,'windows');await saveDorm(h);
+  pickSource(h,'windows');await saveSource(h);
+  assert.equal(h.calls[0].action,'location_source_save');
   assert.equal(h.calls[0].payload.location_source,'windows');
   assert.equal(h.el('authorize-location').textContent,'授权并检测定位');
   assert.match(h.el('location-source-badge').textContent,/真实.*Windows/);
   assert.doesNotMatch(h.el('location-source-badge').textContent,/模拟/);
   assert.match(h.el('location-mode-hint').textContent,/Windows.*决定/);
   assert.match(h.el('location-mode-hint').textContent,/不保证.*Wi-Fi/);
-  assert.match(h.el('location-submit-hint').textContent,/Windows 实时位置/);
+  assert.equal(h.el('location-mode-hint').hidden,false);
+});
+
+test('the removed verbose location paragraphs stay out of the markup',()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.doesNotMatch(html,/location-submit-hint/);
+  assert.doesNotMatch(html,/自动执行需电脑开机/);
+  assert.doesNotMatch(html,/随机偏移/);
+  assert.doesNotMatch(html,/已保存的模拟位置（非实时）/);
 });
 
 for(const saved of ['windows','simulation']){
   test(`unsaved source blocks detection and submission when saved source is ${saved}`,async()=>{
     const h=harness(saved);await settle();
     h.data.dorm.state='ready';await h.refresh();
-    selectSource(h,saved==='windows'?'simulation':'windows');
+    pickSource(h,saved==='windows'?'simulation':'windows');
     h.el('authorize-location').listeners.click();await settle();
     assert.equal(h.calls.length,0);
     assert.match(h.el('toast').textContent,/先保存.*来源/);
@@ -282,7 +332,7 @@ test('unsaved schedule edits or a reverted source do not block detection or subm
   const h=harness();await settle();
   h.data.dorm.state='ready';await h.refresh();
   h.el('auto-interval').value='600';h.el('dorm-form').listeners.input();
-  selectSource(h,'simulation');selectSource(h,'windows');
+  pickSource(h,'simulation');pickSource(h,'windows');
   h.el('authorize-location').listeners.click();await settle();
   assert.equal(h.calls[0]?.action,'location_authorize');
   h.el('submit-dorm').onclick();assert.equal(h.el('confirm-dialog').open,true);
@@ -336,7 +386,7 @@ test('uncertain confirmation only queries when the server has already replaced t
 test('confirmation cannot submit a new unsaved source draft',async()=>{
   const h=harness();await settle();
   h.data.dorm.state='ready';await h.refresh();h.el('submit-dorm').onclick();
-  selectSource(h,'simulation');h.el('confirm-ok').onclick();await settle();
+  pickSource(h,'simulation');h.el('confirm-ok').onclick();await settle();
   assert.equal(h.calls.length,0);
   assert.match(h.el('toast').textContent,/先保存.*来源/);
 });

@@ -204,6 +204,8 @@ class DesktopBridge(LocationProbe):
             if settings.location_source != self._location_state.get('source'):
                 self._reset_location(settings.location_source)
             return '定位来源与自动打卡设置已保存'
+        if action == 'location_source_save':
+            return self._save_location_source(payload.get('location_source', ''))
         if action == 'location_settings':
             os.startfile('ms-settings:privacy-location')
             return '已打开 Windows 定位设置'
@@ -211,6 +213,22 @@ class DesktopBridge(LocationProbe):
             self._window_action(action)
             return '已隐藏到托盘' if action == 'hide' else '正在退出'
         raise RuntimeError('不支持的操作')
+
+    def _save_location_source(self, source):
+        """Change only the location source; the schedule stays exactly as saved."""
+        if source not in ('windows', 'simulation'):
+            raise ValueError('定位来源无效')
+        if self._dorm.busy or self._location_gate.locked():
+            raise RuntimeError('请等待当前打卡或定位检测完成后再切换定位来源。')
+        return self._apply_location_source(source)
+
+    def _apply_location_source(self, source):
+        current = self._dorm.store.settings()
+        if current.location_source != source:
+            self._dorm.save(dataclasses.replace(current, location_source=source))
+            self._reset_location(source)
+        return ('定位来源已切换为模拟定位（非实时，使用已保存样本）' if source == 'simulation'
+                else '定位来源已切换为真实定位（Windows / Wi-Fi）')
 
     def _agent_command(self, command):
         agent_ipc.send_command('youziauth-agent', agent_ipc.AgentCommand(command), timeout_ms=3000)
@@ -314,6 +332,15 @@ class PreviewBridge(LocationProbe):
                 self._data['logs']['network'] += '演示 · 校园网连接检测完成\n'
             elif action == 'network_stop':
                 n.update(monitoring=False, state='stopped', message='后台检测已停止（演示）')
+            elif action == 'location_source_save':
+                source = payload.get('location_source', '')
+                if source not in ('windows', 'simulation'):
+                    return {'ok':False, 'message':'定位来源无效'}
+                if self._location_gate.locked():
+                    return {'ok':False, 'message':'请等待定位检测完成后再切换定位来源。'}
+                if source != d['settings']['location_source']:
+                    self._reset_location(source)
+                    d['settings']['location_source'] = source
             elif action == 'dorm_save':
                 if self._location_gate.locked():
                     return {'ok':False, 'message':'请等待定位检测完成后再保存设置。'}
