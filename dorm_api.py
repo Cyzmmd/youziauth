@@ -155,14 +155,21 @@ class SwuApi:
             raise CheckinError('location_required', '学校未确认当前位置在打卡范围内，未提交')
 
     def submit(self, token, task, position):
+        """POST the form and read the record the school writes back.
+
+        The save response carries the stored instance itself, so `qdjg` is the same
+        success value the read-back looks for and the outcome is known at once. Any
+        other answer - including an empty body - stays unconfirmed.
+        """
         location = dict(position, isArea=True, tip='当前在签到范围内')
-        return self.transport('POST', BASE + 'form-instance/save', token,
+        data = self.transport('POST', BASE + 'form-instance/save', token,
                               query={'formId': task.form_id, 'isSubmitProcess': 'false'}, body={
             'id': task.id, 'businessKey': task.id, 'formId': task.form_id, 'cqfbid': task.publish_id,
             'xh': task.student, 'tsrq': task.date, 'dksj': now().strftime('%Y-%m-%d %H:%M'),
             'qdjg': '0', '$qdjg': '未签到', 'qdtj': '1', 'ycdksfcl': '', 'isArchive': '',
             'qdsj': [task.start, task.end], 'qsqddd': task.address, 'qdbj': task.radius, 'qddz': location,
         })
+        return isinstance(data, dict) and str(data.get('qdjg')) == '1'
 
     def is_signed(self, token, task):
         data = self.transport('GET', SELECT, token,

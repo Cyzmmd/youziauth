@@ -76,6 +76,14 @@ class ApiTests(unittest.TestCase):
         self.replies = [dict(self.selected, qdjg='1')]
         self.assertTrue(self.api.is_signed('secret', task))
 
+    def test_submit_reports_the_confirmation_the_school_writes_back(self):
+        task = self.api.today('secret', 'student', self.current)
+        self.replies = [dict(qdjg='1')]
+        self.assertTrue(self.api.submit('secret', task, {}))
+        self.replies = [dict(qdjg='0'), {}]
+        self.assertFalse(self.api.submit('secret', task, {}))
+        self.assertFalse(self.api.submit('secret', task, {}))
+
     def test_submit_uses_current_task_identifiers(self):
         task = self.api.today('secret', 'student', self.current)
         self.replies = [{}]

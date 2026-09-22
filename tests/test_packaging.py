@@ -142,6 +142,13 @@ class ReleaseMetadataTests(unittest.TestCase):
         version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
         self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
+    def test_version_is_ahead_of_the_last_shipped_msi(self):
+        # Windows refuses to install at or below an installed version, so a VERSION
+        # that lags a shipped build produces an uninstallable MSI.
+        version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
+        shipped = tuple(int(part) for part in version.split("."))
+        self.assertGreater(shipped, (1, 3, 1))
+
     def test_wix_version_comes_from_build_variable(self):
         source = ROOT.joinpath("packaging", "youziauth.wxs").read_text(
             encoding="utf-8"
@@ -160,6 +167,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         self.assertNotIn("upx=True", source)
 
     def test_version_generator_writes_distinct_descriptions(self):
+        version = ROOT.joinpath("VERSION").read_text(encoding="utf-8").strip()
+        numeric = ", ".join(part for part in version.split(".")) + ", 0"
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             subprocess.run(
@@ -179,8 +188,8 @@ class ReleaseMetadataTests(unittest.TestCase):
             self.assertIn(
                 "youziauth SYSTEM campus network authentication agent", agent
             )
-            self.assertIn("1, 1, 4, 0", gui)
-            self.assertIn("1.1.4", agent)
+            self.assertIn(numeric, gui)
+            self.assertIn(version, agent)
 
 
 if __name__ == "__main__":

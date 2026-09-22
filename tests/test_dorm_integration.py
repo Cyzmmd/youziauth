@@ -33,6 +33,9 @@ class SchoolFixture(BaseHTTPRequestHandler):
             self.reply({'columnList': []})
         elif '/verify' in self.path:
             self.reply({'isArea': self.server.in_area})
+        elif self.server.reject_save:
+            # The school answers, but records nothing and keeps the task unsigned.
+            self.reply({'qdjg': '0'})
         else:
             self.server.signed = True
             if self.server.drop_submit_response:
@@ -54,6 +57,7 @@ class ContractTests(unittest.TestCase):
         self.server.signed = False
         self.server.in_area = True
         self.server.drop_submit_response = False
+        self.server.reject_save = False
         self.server.task_data = dict(xh='fixture-student', cqfbid='fixture-publication',
                                     formId='fixture-form', qdsj=['21:00', '23:30'],
                                     qsqddd='测试宿舍', qdbj='800米', tsrq='2026-09-21')
@@ -84,6 +88,19 @@ class ContractTests(unittest.TestCase):
     def test_lost_save_response_resolves_by_readback(self):
         self.server.drop_submit_response = True
         self.assertEqual(self.engine.run(submit=True).state, 'signed')
+
+    def test_unrecorded_save_is_reported_and_then_retried(self):
+        # Regression: one rejected POST used to leave the marker behind, which turned every
+        # later attempt into a read-back only and cost the whole night's check-in.
+        self.server.reject_save = True
+        first = self.engine.run(submit=True)
+        self.assertEqual(first.state, 'ready')
+        self.assertIn('未生效', first.message)
+        self.assertFalse(self.server.signed)
+        self.server.reject_save = False
+        self.assertEqual(self.engine.run(submit=True).state, 'signed')
+        saves = [r for r in self.server.calls if '/save' in r[0]]
+        self.assertEqual(len(saves), 2)
 
     def test_out_of_area_does_not_post_save(self):
         self.server.in_area = False

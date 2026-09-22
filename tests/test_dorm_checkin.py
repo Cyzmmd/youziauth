@@ -7,7 +7,8 @@ from unittest.mock import Mock
 
 PRESENT = importlib.util.find_spec('dorm_checkin') is not None
 if PRESENT:
-    from dorm_checkin import Settings, Store, Engine, Task, Result, SHANGHAI
+    from dorm_checkin import (CheckinError, Engine, Result, Settings, Store, SUBMIT_MAX_ATTEMPTS,
+                              Task, SHANGHAI)
 
 
 class FeatureExists(unittest.TestCase):
@@ -83,24 +84,108 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.run(submit=True).state, 'error')
         self.api.submit.assert_not_called()
 
-    def test_success_requires_readback(self):
-        self.api.is_signed.return_value = False
-        self.assertEqual(self.engine.run(submit=True).state, 'uncertain')
-        self.api.is_signed.assert_called_once()
-        self.assertEqual(self.store.pending(), self.task.key)
+    def test_save_response_alone_confirms_the_check_in(self):
+        self.api.submit.return_value = True
+        self.assertEqual(self.engine.run(submit=True).state, 'signed')
+        self.api.is_signed.assert_not_called()
+        self.assertEqual(self.store.pending(), '')
 
-    def test_timeout_is_read_back_and_not_resubmitted_even_after_restart(self):
-        self.api.submit.side_effect = TimeoutError()
+    def test_unconfirmed_save_response_is_settled_by_readback(self):
+        self.api.submit.return_value = False
+        self.assertEqual(self.engine.run(submit=True).state, 'signed')
+        self.api.is_signed.assert_called_once()
+        self.assertEqual(self.store.pending(), '')
+
+    def test_confirmed_non_submission_reports_the_reason_instead_of_hiding_it(self):
+        self.api.submit.side_effect = CheckinError('network_error', '学校接口暂不可用，请稍后重试')
         self.api.is_signed.return_value = False
+        result = self.engine.run(submit=True)
+        self.assertEqual(result.state, 'ready')
+        self.assertIn('学校接口暂不可用', result.message)
+        self.assertIn('重试', result.message)
+        self.assertEqual(self.store.pending(), '')
+        self.assertEqual(self.store.attempts(self.task.key)[0], 1)
+
+    def test_lost_login_is_reported_and_stays_retryable(self):
+        self.api.submit.side_effect = CheckinError('login_required', '登录已失效，请重新登录')
+        self.api.is_signed.return_value = False
+        result = self.engine.run(submit=True)
+        self.assertEqual(result.state, 'login_required')
+        self.assertIn('本次提交未记录', result.message)
+        self.assertEqual(self.store.pending(), '')
+
+    def test_unknown_outcome_stays_readback_only_even_after_restart(self):
+        self.api.submit.side_effect = TimeoutError()
+        self.api.is_signed.side_effect = OSError('offline')
         self.assertEqual(self.engine.run(submit=True).state, 'uncertain')
         other = Engine(self.store, self.api, self.position, clock=lambda: self.now)
         self.assertEqual(other.run(submit=True).state, 'uncertain')
         self.assertEqual(self.api.submit.call_count, 1)
+        self.assertEqual(self.store.pending(), self.task.key)
+
+    def test_unrecorded_submission_is_retried_on_the_next_automatic_run(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.api.submit.side_effect = [CheckinError('network_error', '学校接口暂不可用，请稍后重试'), True]
+        self.api.is_signed.return_value = False
+        self.assertEqual(self.engine.run(automatic=True, submit=True).state, 'ready')
+        self.now += dt.timedelta(minutes=5)
+        self.assertEqual(self.engine.run(automatic=True, submit=True).state, 'signed')
+        self.assertEqual(self.api.submit.call_count, 2)
+        self.assertEqual(self.store.attempts(self.task.key)[0], 0)
+
+    def test_automatic_retry_waits_for_the_cooldown(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.api.submit.side_effect = CheckinError('network_error', '学校接口暂不可用，请稍后重试')
+        self.api.is_signed.return_value = False
+        self.engine.run(automatic=True, submit=True)
+        result = self.engine.run(automatic=True, submit=True)
+        self.assertEqual(result.state, 'ready')
+        self.assertIn('秒后可重试', result.message)
+        self.assertEqual(self.api.submit.call_count, 1)
+
+    def test_automatic_retries_are_capped_and_then_reported(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.api.submit.side_effect = CheckinError('network_error', '学校接口暂不可用，请稍后重试')
+        self.api.is_signed.return_value = False
+        for _ in range(SUBMIT_MAX_ATTEMPTS):
+            self.engine.run(automatic=True, submit=True)
+            self.now += dt.timedelta(minutes=5)
+        self.assertEqual(self.api.submit.call_count, SUBMIT_MAX_ATTEMPTS)
+        result = self.engine.run(automatic=True, submit=True)
+        self.assertEqual(result.state, 'uncertain')
+        self.assertIn('上限', result.message)
+        self.assertEqual(self.api.submit.call_count, SUBMIT_MAX_ATTEMPTS)
+
+    def test_a_manual_submission_is_never_blocked_by_the_retry_limits(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.api.submit.side_effect = CheckinError('network_error', '学校接口暂不可用，请稍后重试')
+        self.api.is_signed.return_value = False
+        for _ in range(SUBMIT_MAX_ATTEMPTS + 1):
+            self.engine.run(automatic=True, submit=True)
+            self.now += dt.timedelta(minutes=5)
+        self.assertEqual(self.api.submit.call_count, SUBMIT_MAX_ATTEMPTS)
+        self.engine.run(submit=True)
+        self.assertEqual(self.api.submit.call_count, SUBMIT_MAX_ATTEMPTS + 1)
 
     def test_readback_can_resolve_a_timeout(self):
         self.api.submit.side_effect = TimeoutError()
         self.assertEqual(self.engine.run(submit=True).state, 'signed')
         self.assertEqual(self.store.pending(), '')
+
+    def test_attempts_are_per_task_and_older_keys_are_dropped(self):
+        self.store.record_attempt(self.task.key, 100)
+        self.store.record_attempt(self.task.key, 200)
+        self.assertEqual(Store(self.store.root).attempts(self.task.key), (2, 200))
+        self.store.record_attempt('another-task', 300)
+        self.assertEqual(self.store.attempts('another-task'), (1, 300))
+        self.assertEqual(self.store.attempts(self.task.key), (0, 0.0))
+        self.store.clear_attempts('another-task')
+        self.assertEqual(self.store.attempts('another-task'), (0, 0.0))
+
+    def test_corrupt_attempt_record_fails_closed(self):
+        (self.store.root / 'submit-attempts.json').write_text('{"broken": 1}')
+        self.assertEqual(self.engine.run(submit=True).state, 'error')
+        self.api.submit.assert_not_called()
 
     def test_location_error_cannot_submit(self):
         from dorm_checkin import CheckinError
@@ -148,7 +233,8 @@ class EngineTests(unittest.TestCase):
 
     def test_account_switch_preserves_each_uncertain_submission(self):
         import dataclasses
-        self.api.is_signed.return_value = False
+        self.api.submit.side_effect = TimeoutError()
+        self.api.is_signed.side_effect = OSError('offline')
         self.assertEqual(self.engine.run(submit=True).state, 'uncertain')
         original = self.task
         self.api.user.return_value = 'other'
@@ -158,6 +244,20 @@ class EngineTests(unittest.TestCase):
         self.api.today.return_value = original
         self.assertEqual(self.engine.run(submit=True).state, 'uncertain')
         self.assertEqual(self.api.submit.call_count, 2)
+        self.assertTrue(self.store.pending(original.key))
+        self.assertTrue(self.store.pending(self.api.today.return_value.key))
+
+    def test_attempts_do_not_leak_between_tasks(self):
+        import dataclasses
+        self.api.submit.return_value = False
+        self.api.is_signed.return_value = False
+        self.assertEqual(self.engine.run(submit=True).state, 'ready')
+        original = self.task
+        self.api.user.return_value = 'other'
+        self.api.today.return_value = dataclasses.replace(original, student='other', id='task-2')
+        self.assertEqual(self.engine.run(submit=True).state, 'ready')
+        self.assertEqual(self.api.submit.call_count, 2)
+        self.assertEqual(self.store.attempts(original.key), (0, 0.0))
 
     def test_cancel_during_marker_write_does_not_submit_or_leave_pending(self):
         write = self.store.set_pending
