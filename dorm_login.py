@@ -22,18 +22,29 @@ def check_cancel(cancel):
         raise CheckinError('cancelled', '登录已取消')
 
 
-def open_login_page(page, cancel):
+def open_login_page(page, cancel, authenticated=None):
     def navigate(url, stage):
         check_cancel(cancel)
         try:
             response = page.goto(url, wait_until='domcontentloaded', timeout=30000)
         except Exception:
-            raise CheckinError('login_required', f'{stage}未能加载，请检查网络后重新登录') from None
+            raise CheckinError('network_error', f'{stage}未能加载，请检查网络后重试') from None
         if response is not None and response.status >= 400:
-            raise CheckinError('login_required', f'{stage}返回 HTTP {response.status}，请重新登录')
+            state = 'login_required' if response.status in (401, 403) else 'network_error'
+            raise CheckinError(state, f'{stage}返回 HTTP {response.status}，请稍后重试或手动登录')
+
+    def awaiting_exchange():
+        url = urlsplit(page.url)
+        return ((authenticated and authenticated()) or
+                (url.scheme == 'https' and url.hostname == 'of.swu.edu.cn'
+                 and url.fragment.split('?')[0] == '/casLogin'))
 
     navigate(INIT_URL, '学校登录初始页')
+    if awaiting_exchange():
+        return
     navigate(LOGIN_URL, '联邦认证中转页')
+    if awaiting_exchange():
+        return
     url = urlsplit(page.url)
     if url.scheme == 'https' and url.hostname == 'uaaap.swu.edu.cn' and url.path == '/cas/login':
         # Same action as the school's _goLogin(), retaining all current session parameters.
@@ -64,7 +75,7 @@ def browser_executable():
 
 
 @contextlib.contextmanager
-def owned_browser(playwright, cancel):
+def owned_browser(playwright, cancel, *, headless=False):
     """Match upstream's native browser session, with an isolated profile/ephemeral CDP port."""
     check_cancel(cancel)
     executable = browser_executable()
@@ -75,7 +86,8 @@ def owned_browser(playwright, cancel):
             port = reserved.getsockname()[1]
         process = subprocess.Popen([
             str(executable), f'--remote-debugging-port={port}', '--remote-debugging-address=127.0.0.1',
-            f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check', 'about:blank',
+            f'--user-data-dir={profile}', '--no-first-run', '--no-default-browser-check',
+            *(['--headless=new'] if headless else []), 'about:blank',
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         browser = None
@@ -108,12 +120,18 @@ def owned_browser(playwright, cancel):
                     process.wait(timeout=5)
 
 
+def is_token_exchange(value):
+    try:
+        url = urlsplit(value)
+        return (url.scheme == 'https' and url.hostname == 'of.swu.edu.cn' and url.port in (None, 443)
+                and url.path.startswith('/gateway/') and 'exchange-token' in url.path)
+    except ValueError:
+        return False
+
+
 def extract_token(response):
     try:
-        url = urlsplit(response.url)
-        if (url.scheme != 'https' or url.hostname != 'of.swu.edu.cn' or url.port not in (None, 443)
-                or not url.path.startswith('/gateway/') or 'exchange-token' not in url.path
-                or response.status != 200):
+        if not is_token_exchange(response.url) or response.status != 200:
             return None
         value = response.headers.get('fighter-auth-token')
         if not value:
@@ -126,41 +144,86 @@ def extract_token(response):
     return None
 
 
-def login(store, api, cancel, timeout=300):
+def school_cookies(cookies):
+    domains = {'swu.edu.cn', 'of.swu.edu.cn', 'uaaap.swu.edu.cn', 'idm.swu.edu.cn'}
+    current = time.time()
+    return [cookie for cookie in cookies
+            if cookie.get('domain', '').lstrip('.') in domains
+            and (cookie.get('expires', -1) == -1 or cookie['expires'] > current)]
+
+
+def login(store, api, cancel, timeout=300, *, interactive=True):
+    check_cancel(cancel)
+    try:
+        session = store.browser_session(store.token())
+    except CheckinError:
+        if not interactive:
+            raise
+        session = None
+    cookies = school_cookies(session['cookies']) if session else []
+    if not interactive and not cookies:
+        raise CheckinError('login_required', '没有可恢复的学校会话，请手动登录一次')
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise CheckinError('error', '缺少登录组件，请安装 requirements-dorm.txt 中的依赖或使用完整安装包') from None
-    if cancel.is_set():
-        raise CheckinError('cancelled', '登录已取消')
     try:
-        with sync_playwright() as playwright, owned_browser(playwright, cancel) as browser:
+        with sync_playwright() as playwright, owned_browser(playwright, cancel, headless=not interactive) as browser:
             context = browser.contexts[0]
-            token = []
+            if cookies:
+                context.add_cookies(cookies)
+            token, failures = [], []
 
             def capture(response):
                 value = extract_token(response)
                 if value and not token:
                     token.append(value)
+                elif not value and is_token_exchange(response.url):
+                    code = str(response.status)
+                    if response.status == 200:
+                        try:
+                            data = response.json()
+                            code = str(data.get('code')) if isinstance(data, dict) else 'invalid'
+                        except Exception:
+                            code = 'invalid'
+                    if response.status >= 400 or (response.status == 200 and code != '200'):
+                        state = 'login_required' if code in ('401', '403') else 'network_error'
+                        failures.append(CheckinError(state, '学校登录交换未成功，请稍后重试或手动登录'))
 
             context.on('response', capture)
             page = context.pages[0] if context.pages else context.new_page()
-            open_login_page(page, cancel)
-            deadline = time.monotonic() + timeout
-            while not token and time.monotonic() < deadline:
-                if cancel.is_set():
-                    raise CheckinError('cancelled', '登录已取消')
+            open_login_page(page, cancel, authenticated=lambda: bool(token))
+            deadline = time.monotonic() + (timeout if interactive else min(timeout, 30))
+            while not token and not failures and time.monotonic() < deadline:
+                check_cancel(cancel)
                 if not context.pages:
                     raise CheckinError('cancelled', '登录窗口已关闭')
                 context.pages[0].wait_for_timeout(200)
+            check_cancel(cancel)
             if not token:
-                raise CheckinError('login_required', '登录等待超时，请重试')
+                if failures:
+                    raise failures[-1]
+                if interactive:
+                    raise CheckinError('login_required', '登录等待超时，请重试')
+                challenge = page.locator('input[type="password"], input[autocomplete="one-time-code"], '
+                                         'input[name*="captcha" i]').first.is_visible()
+                check_cancel(cancel)
+                if challenge:
+                    raise CheckinError('login_required', '学校会话已过期或需要验证码，请手动登录')
+                raise CheckinError('network_error', '学校登录交换未完成，已保留会话，请稍后重试')
             student = api.user(token[0])
-            if cancel.is_set():
-                raise CheckinError('cancelled', '登录已取消')
-            store.save_token(token[0])
+            check_cancel(cancel)
+            if not interactive and student != session['student']:
+                raise CheckinError('login_required', '恢复的登录账号不一致，请手动登录')
+            cookies = school_cookies(context.cookies())
+            check_cancel(cancel)
+            store.save_browser_session(token[0], student, cookies)
             return student
-    except CheckinError:
+    except CheckinError as exc:
+        if not interactive and exc.state == 'login_required':
+            store.clear_browser_session()
         raise
     except Exception:
+        if not interactive:
+            raise CheckinError('error', '登录会话恢复未完成，请稍后重试或手动登录') from None
         raise CheckinError('login_required', '登录未完成，请重新打开登录窗口') from None

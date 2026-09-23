@@ -14,6 +14,7 @@ from pathlib import Path
 from windows_credentials import CredentialStore, DpapiProtector, atomic_write_bytes
 
 SHANGHAI = dt.timezone(dt.timedelta(hours=8))
+LOGIN_RECORD_PREFIX = 'youziauth-session-v1\n'
 
 # A submission the school never recorded may be repeated, but only once the read-back says
 # the task is still unsigned. That keeps the write-ahead marker meaning what it says - an
@@ -128,13 +129,25 @@ class Store:
     def save_settings(self, settings):
         self._write('settings.json', dataclasses.asdict(settings.validate()))
 
-    def token(self):
+    def _login_record(self):
         if not (self.root / 'session' / 'credential.dat').exists():
-            return ''
+            return {'token': ''}
         try:
-            return self._credentials().load_password()
+            value = self._credentials().load_password()
+            # Legacy tokens cannot contain a newline, so the record prefix is unambiguous.
+            if not value.startswith(LOGIN_RECORD_PREFIX):
+                return {'token': value}
+            session = json.loads(value[len(LOGIN_RECORD_PREFIX):])
+            if (not isinstance(session, dict) or not isinstance(session.get('token'), str)
+                    or not isinstance(session.get('student'), str) or not session['student']
+                    or not isinstance(session.get('cookies'), list)):
+                raise ValueError('Invalid login record')
+            return session
         except Exception:
             raise CheckinError('login_required', '登录凭据无法解密，请重新登录') from None
+
+    def token(self):
+        return self._login_record()['token']
 
     def save_token(self, token):
         if not isinstance(token, str) or not token.strip() or any(c in token for c in '\r\n'):
@@ -143,6 +156,21 @@ class Store:
 
     def clear_token(self):
         (self.root / 'session' / 'credential.dat').unlink(missing_ok=True)
+
+    def browser_session(self, token):
+        if not token:
+            return None
+        session = self._login_record()
+        return session if session['token'] == token and 'cookies' in session else None
+
+    def save_browser_session(self, token, student, cookies):
+        session = dict(token=token, student=student, cookies=cookies)
+        self._credentials().save_password(LOGIN_RECORD_PREFIX + json.dumps(session, ensure_ascii=False))
+
+    def clear_browser_session(self):
+        token = self.token()
+        if token:
+            self.save_token(token)
 
     def _pending_keys(self):
         value = self._read('pending.json', [])
@@ -321,6 +349,10 @@ class Engine:
         """
         try:
             signed = self.api.is_signed(token, task)
+        except CheckinError as exc:
+            if exc.state == 'login_required':
+                return self._result('login_required', '登录已失效，提交结果待确认；恢复登录后仅回查', task)
+            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
         except Exception:
             return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
         if signed:

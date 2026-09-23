@@ -9,4 +9,22 @@
   ::-webkit-scrollbar,::-webkit-scrollbar-track,::-webkit-scrollbar-thumb,::-webkit-scrollbar-button,::-webkit-scrollbar-corner{background:transparent}
 }
 
+.update-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;overflow-wrap:anywhere}
+.update-notice:not(.error){background:var(--soft);color:var(--blue)}
+.update-notice a{flex-shrink:0;text-decoration:underline;text-underline-offset:3px}
+.update-card .card-label h3{margin-bottom:0}
+.update-versions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 28px;margin:14px 0 20px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.update-versions .info-row{margin:0;flex-wrap:wrap}
+.update-versions strong{font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.update-card>.muted{margin-bottom:0;overflow-wrap:anywhere}
+.update-download{margin-top:20px;font-variant-numeric:tabular-nums}
+.update-download .info-row{flex-wrap:wrap;gap:6px 15px}
+.update-download progress{display:block;width:100%;height:9px;margin-top:10px;appearance:none;border:0;border-radius:9px;overflow:hidden;background:var(--soft);accent-color:var(--blue)}
+.update-download progress::-webkit-progress-bar{background:var(--soft);border-radius:9px}
+.update-download progress::-webkit-progress-value{background:var(--blue);border-radius:9px}
+.update-download progress::-moz-progress-bar{background:var(--blue);border-radius:9px}
+.update-policy{margin-top:18px}
+.update-policy p+p{margin-top:7px}
+@media(max-width:760px){.update-notice{align-items:flex-start;flex-direction:column}.update-versions{grid-template-columns:1fr}.update-card .card-label{flex-wrap:wrap}}
+
 .location-check{padding:12px 14px;border:1px solid var(--border);border-radius:9px;margin:15px 0;background:rgba(232,236,240,.45);font-size:12px}.location-check small{display:block;margin-top:7px;color:var(--muted);font-size:10px}.location-success{color:var(--green)}.location-error{color:var(--red)}.location-settings{margin-top:12px}.location-source-settings{border-top:1px solid var(--border);margin-top:24px;padding-top:19px}.location-source-settings label{margin-top:0}.location-source-card label{margin-top:15px}.location-source-card select{width:100%}.location-source-card .badge{display:block;margin-top:11px;text-align:center}

@@ -47,6 +47,41 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(save.call_args.args[1].password, '')
         self.assertEqual(save.call_args.args[1].check_interval_seconds, 90)
 
+    def test_update_snapshot_and_actions_are_isolated_from_school_operations(self):
+        state = self.bridge.snapshot()
+        self.assertIn('update', state)
+        self.assertEqual(state['update']['state'], 'idle')
+        with patch.object(self.bridge._updates, 'check', return_value='正在检查') as check:
+            self.assertTrue(self.bridge.dispatch('update_check')['ok'])
+            check.assert_called_once_with()
+        self.controller.start.assert_not_called()
+        self.controller.poll.assert_not_called()
+
+    def test_update_install_requires_explicit_confirmation_and_no_active_operations(self):
+        self.assertFalse(self.bridge.dispatch('update_install', {'version': '1.5.0'})['ok'])
+        with patch.object(self.bridge._updates, 'install', return_value='打开安装向导') as install:
+            self.controller.busy = True
+            self.assertFalse(self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})['ok'])
+            install.assert_not_called()
+            self.controller.busy = False
+            self.assertTrue(self.bridge.dispatch('update_install', {'confirmed': True, 'version': '1.5.0'})['ok'])
+            install.assert_called_once_with(True, '1.5.0')
+
+    def test_preview_update_download_is_synthetic_and_install_never_opens_windows(self):
+        with patch('desktop_bridge.UpdateController') as controller:
+            preview = PreviewBridge()
+            self.assertEqual(preview.snapshot()['update']['state'], 'idle')
+            with patch('desktop_bridge.time.monotonic', return_value=100):
+                self.assertTrue(preview.dispatch('update_check')['ok'])
+                self.assertEqual(preview.snapshot()['update']['state'], 'downloading')
+            with patch('desktop_bridge.time.monotonic', return_value=110):
+                update = preview.snapshot()['update']
+                self.assertEqual(update['state'], 'ready')
+            self.assertFalse(preview.dispatch('update_install', {'version': update['latest_version']})['ok'])
+            self.assertTrue(preview.dispatch('update_install', {'confirmed': True, 'version': update['latest_version']})['ok'])
+            self.assertEqual(preview.snapshot()['update']['state'], 'launched')
+            controller.assert_not_called()
+
     def test_unknown_action_is_rejected(self):
         self.assertFalse(self.bridge.dispatch('__dict__', {})['ok'])
         self.controller.start.assert_not_called()

@@ -172,6 +172,18 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.run(submit=True).state, 'signed')
         self.assertEqual(self.store.pending(), '')
 
+    def test_expired_login_during_readback_preserves_pending_until_renewal(self):
+        self.api.submit.side_effect = TimeoutError()
+        self.api.is_signed.side_effect = CheckinError('login_required', '登录已失效')
+        self.assertEqual(self.engine.run(submit=True).state, 'login_required')
+        self.assertTrue(self.store.pending(self.task.key))
+        self.store.save_token('renewed-token')
+        self.api.is_signed.side_effect = None
+        self.api.is_signed.return_value = True
+        self.assertEqual(self.engine.run(submit=False).state, 'signed')
+        self.assertEqual(self.api.submit.call_count, 1)
+        self.assertFalse(self.store.pending(self.task.key))
+
     def test_attempts_are_per_task_and_older_keys_are_dropped(self):
         self.store.record_attempt(self.task.key, 100)
         self.store.record_attempt(self.task.key, 200)
@@ -289,6 +301,75 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.run(submit=True).state, 'expired')
         self.api.submit.assert_not_called()
         self.assertEqual(self.store.pending(), '')
+
+
+class SessionStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(hasattr(Store, 'save_browser_session'), 'Encrypted browser session storage missing')
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.protector = Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1])
+        self.store = Store(Path(self.temp.name), protector=self.protector)
+        self.cookies = [dict(name='SSO', value='private-cookie', domain='idm.swu.edu.cn',
+                             path='/', expires=-1, httpOnly=True, secure=True, sameSite='Lax')]
+
+    def test_session_survives_store_restart_without_plaintext_secrets(self):
+        self.store.save_token('private-token')
+        self.store.save_browser_session('private-token', 'student', self.cookies)
+        restarted = Store(self.store.root, protector=self.protector)
+        session = restarted.browser_session(restarted.token())
+        self.assertEqual(session['student'], 'student')
+        self.assertEqual(session['cookies'], self.cookies)
+        for path in self.store.root.rglob('*'):
+            if path.is_file():
+                self.assertNotIn(b'private-cookie', path.read_bytes())
+                self.assertNotIn(b'private-token', path.read_bytes())
+
+    def test_session_replacement_commits_matching_token_and_cookies(self):
+        self.store.save_token('old-token')
+        self.store.save_browser_session('old-token', 'student', self.cookies)
+        renewed_cookies = [dict(self.cookies[0], value='renewed-cookie')]
+        self.store.save_browser_session('new-token', 'student', renewed_cookies)
+        restarted = Store(self.store.root, protector=self.protector)
+        self.assertEqual(restarted.token(), 'new-token')
+        self.assertEqual(restarted.browser_session('new-token')['cookies'], renewed_cookies)
+
+    def test_token_only_installation_has_no_browser_session(self):
+        self.store.save_token('existing-token')
+        self.assertIsNone(self.store.browser_session('existing-token'))
+        self.assertEqual(self.store.token(), 'existing-token')
+
+    def test_session_cannot_be_reused_for_a_different_token(self):
+        self.store.save_browser_session('old-token', 'student', self.cookies)
+        self.store.save_token('other-token')
+        self.assertIsNone(self.store.browser_session(self.store.token()))
+        self.assertIsNone(self.store.browser_session(''))
+
+    def test_logout_removes_session_without_removing_settings_or_pending(self):
+        self.store.save_token('private-token')
+        self.store.save_browser_session('private-token', 'student', self.cookies)
+        self.store.save_settings(Settings(start='20:00'))
+        self.store.set_pending('unconfirmed-task')
+        self.store.clear_token()
+        self.assertEqual(self.store.token(), '')
+        self.assertIsNone(self.store.browser_session('private-token'))
+        self.assertEqual(self.store.settings().start, '20:00')
+        self.assertTrue(self.store.pending('unconfirmed-task'))
+
+    def test_invalidating_browser_session_preserves_current_token(self):
+        self.store.save_token('private-token')
+        self.store.save_browser_session('private-token', 'student', self.cookies)
+        self.store.clear_browser_session()
+        self.assertEqual(self.store.token(), 'private-token')
+        self.assertIsNone(self.store.browser_session('private-token'))
+
+    def test_session_decryption_failure_reports_no_secrets(self):
+        self.store.save_browser_session('private-token', 'student', self.cookies)
+        broken = Store(self.store.root, protector=Mock(unprotect=Mock(side_effect=ValueError('private-cookie'))))
+        with self.assertRaises(CheckinError) as caught:
+            broken.browser_session('private-token')
+        self.assertEqual(caught.exception.state, 'login_required')
+        self.assertNotIn('private-cookie', str(caught.exception))
 
 
 if __name__ == '__main__':

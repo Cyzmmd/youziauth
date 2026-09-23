@@ -41,6 +41,15 @@ class PackagingWorkflowTests(unittest.TestCase):
         self.assertIn("THIRD_PARTY_NOTICES.md", spec)
         self.assertIn("third_party_licenses", spec)
 
+    def test_frozen_application_can_read_the_bundled_version(self):
+        analysis = []
+        scope = {'Analysis': lambda *args, **kwargs: analysis.append(kwargs) or type('Bundle', (), {'pure': [], 'scripts': [], 'binaries': [], 'datas': []})(),
+                 'MERGE': lambda *args: None, 'PYZ': lambda *args: None,
+                 'EXE': lambda *args, **kwargs: None, 'COLLECT': lambda *args, **kwargs: None}
+        exec(compile(ROOT.joinpath('packaging', 'youziauth.spec').read_text(encoding='utf-8'), 'youziauth.spec', 'exec'), scope)
+        bundled = {Path(source).name: destination for source, destination in analysis[0]['datas']}
+        self.assertEqual(bundled.get('VERSION'), '.')
+
     def test_pyinstaller_spec_builds_gui_and_system_agent_without_user_secrets(self):
         spec = ROOT.joinpath("packaging", "youziauth.spec").read_text(
             encoding="utf-8"

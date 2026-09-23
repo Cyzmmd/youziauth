@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',records:'运行记录'};
+const titles = {overview:'今日概览',network:'校园网',dorm:'寝室打卡',records:'运行记录',updates:'软件更新'};
 let state = null, logType = 'network', pending = false, refreshTask = null, epoch = 0, syncedEpoch = -1, timer;
 const dirty = {network:false, dorm:false};
 const revisions = {network:0, dorm:0};
@@ -109,9 +109,53 @@ function render() {
   $('cancel-dorm').disabled=pending||!d.busy;
   $('logout-dorm').disabled=pending||d.busy;
   document.querySelectorAll('button[type="submit"]').forEach(b=>b.disabled=pending||(b.closest('form').id==='dorm-form'&&d.busy));
+  renderUpdates();
   renderLogs();
 }
 function renderLogs(){if(!state)return;const text=state.logs[logType]||'';$('log-output').textContent=text;$('log-output').hidden=!text.trim();$('empty-records').hidden=!!text.trim();}
+function updateSize(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1048576)return (bytes/1024).toFixed(1)+' KiB';
+  return (bytes/1048576).toFixed(1)+' MiB';
+}
+function renderUpdates(){
+  const u=state.update,ready=u.state==='ready',error=u.state==='error';
+  const names={idle:'等待检查',checking:'正在检查',downloading:'正在下载',verifying:'正在验证',ready:'可以安装',up_to_date:'无需更新',error:'更新未完成',launching:'正在打开安装向导',launched:'已打开安装向导'};
+  badge('update-status',names[u.state],error?'error':ready||u.state==='up_to_date'?'success':'');
+  $('update-current-version').textContent=u.current_version;
+  $('update-latest-version').textContent=u.latest_version||'尚未检查';
+  $('update-message').textContent=u.message;
+  $('update-checked').textContent=u.checked?'最近检查 · '+u.checked:'尚未检查';
+  $('check-updates').textContent=error?'重新检查':'检查更新';
+  const blocked=pending||syncedEpoch!==epoch||u.busy;
+  $('check-updates').disabled=blocked;
+  $('install-update').hidden=!ready;
+  $('install-update').disabled=blocked||!ready;
+  const progressVisible=['downloading','verifying','ready','launching','launched'].includes(u.state);
+  $('update-progress').hidden=!progressVisible;
+  $('update-progress').value=u.progress;
+  $('update-progress-label').textContent=progressVisible?'下载进度 · '+Math.round(u.progress)+'%':'下载进度';
+  $('update-download-size').textContent=u.total_bytes?updateSize(u.downloaded_bytes)+' / '+updateSize(u.total_bytes)
+    :u.downloaded_bytes||u.state==='downloading'?updateSize(u.downloaded_bytes)+' · 总大小未知':'尚未下载';
+  const notice=ready?'新版本 '+u.latest_version+' 可以安装 · '+u.message+' 安装前需要你的确认。':error?'软件更新未完成 · '+u.message:'';
+  // Keep polling quiet, including the live region when its text has not changed.
+  if($('update-notice-text').textContent!==notice)$('update-notice-text').textContent=notice;
+  $('update-notice').classList.toggle('error',error);
+  $('update-notice').hidden=!ready&&!error;
+}
+function requireUpdateSync(){
+  if(!state||syncedEpoch!==epoch){notify('更新状态尚未同步，请稍后重试。',true);return false;}
+  if(pending){notify('其他操作正在处理，请稍后重试。',true);return false;}
+  return true;
+}
+function requireReadyUpdate(){
+  if(!requireUpdateSync())return false;
+  if(state.update.state!=='ready'||state.update.busy){notify('更新状态已变化，请在下载与验证完成后重新确认。',true);return false;}
+  if(dirty.network||dirty.dorm||sourceDirty||$('location-source').value!==savedLocationSource()){
+    notify('有未保存的校园网、寝室打卡或定位来源设置，请先保存，再安装更新，避免丢失修改。',true);return false;
+  }
+  return true;
+}
 async function refresh(){
   if(!api)return;
   if(refreshTask)return refreshTask;
@@ -177,6 +221,20 @@ function confirmAction(title,text,action){previousFocus=document.activeElement;$
 $('confirm-cancel').onclick=()=>$('confirm-dialog').close();
 $('confirm-dialog').addEventListener('close',()=>{confirmation=null;previousFocus?.focus();});
 $('confirm-ok').onclick=()=>{const action=confirmation;$('confirm-dialog').close();if(action)action();};
+$('check-updates').onclick=()=>{
+  if(!requireUpdateSync())return;
+  if(state.update.busy){notify('正在检查、下载或验证更新，请稍候。');return;}
+  act('update_check');
+};
+$('install-update').onclick=()=>{
+  if(!requireReadyUpdate())return;
+  const version=state.update.latest_version,confirmedEpoch=syncedEpoch;
+  confirmAction('安装更新 '+version+'？','确认后将重新验证安装包并打开安装向导，Windows 会请求管理员授权。安装期间会关闭本程序与系统代理，完成后需重新打开程序。打开向导不代表安装成功；取消不会安装，也不会退出程序。',()=>{
+    if(!requireReadyUpdate())return;
+    if(syncedEpoch!==confirmedEpoch||state.update.latest_version!==version){notify('更新版本或同步状态已变化，请重新确认。',true);return;}
+    act('update_install',{confirmed:true,version});
+  });
+};
 $('submit-dorm').onclick=()=>{
   if(!requireSavedLocationSource())return;
   const source=savedLocationSource(),recheck=state.dorm.state==='uncertain';

@@ -24,6 +24,7 @@ class DormController:
         self.closed = False
         self._gate = threading.Lock()
         self._poll_at = 0.0
+        self._renew_at = 0.0
         self.latest = Result('idle', '尚未查询今日任务')
 
     def _locate(self):
@@ -42,16 +43,15 @@ class DormController:
             try:
                 if action == 'login':
                     login(self.store, self.api, self.engine.cancel)
+                    self._renew_at = 0.0
                     result = Result('logged_in', '登录成功，凭据已在本机加密保存')
                 elif action == 'logout':
                     settings = self.store.settings()
                     self.store.save_settings(dataclasses.replace(settings, enabled=False))
                     self.store.clear_token()
                     result = Result('login_required', '登录凭据已清除，自动打卡已关闭')
-                elif action == 'automatic':
-                    result = self.engine.tick()
                 else:
-                    result = self.engine.run(submit=action == 'submit')
+                    result = self._run(action)
                 if result is not None and result.state not in ('disabled', 'waiting'):
                     self.events.put(result)
                 elif result is not None and action != 'automatic':
@@ -66,6 +66,24 @@ class DormController:
 
         threading.Thread(target=work, name='youziauth-dorm-' + action, daemon=True).start()
         return True
+
+    def _run(self, action):
+        automatic = action == 'automatic'
+        result = self.engine.tick() if automatic else self.engine.run(submit=action == 'submit')
+        if result is None or result.state != 'login_required' or time.monotonic() < self._renew_at:
+            return result
+        self._renew_at = time.monotonic() + 300
+        try:
+            login(self.store, self.api, self.engine.cancel, interactive=False)
+        except CheckinError as exc:
+            result = Result(exc.state, str(exc), result.task, now().isoformat(timespec='seconds'))
+            self.store.record(result)
+            return result
+        # A known task may already have been submitted; renewal must never replay that write.
+        result = self.engine.run(automatic=automatic, submit=(automatic or action == 'submit') and result.task is None)
+        if result.state == 'login_required':
+            self.store.clear_browser_session()
+        return result
 
     def poll(self):
         if self.closed or time.monotonic() < self._poll_at:

@@ -7,6 +7,7 @@ ROOT = Path.cwd()
 VERSION_DIR = ROOT / "build" / "version"
 
 datas = [
+    (str(ROOT / "VERSION"), "."),
     (str(ROOT / "config.example.ini"), "."),
     (str(ROOT / "assets"), "assets"),
     (str(ROOT / "desktop_ui"), "desktop_ui"),
