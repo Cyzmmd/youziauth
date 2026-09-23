@@ -5,8 +5,12 @@ import copy
 import dataclasses
 import datetime as dt
 import os
+import sys
 import threading
+import time
 from pathlib import Path
+
+from app_update import UpdateController, read_current_version
 
 import agent_ipc
 import campus_auth
@@ -97,6 +101,15 @@ class DesktopBridge(LocationProbe):
         self._notification_tracker = windows_notifications.NotificationTracker()
         self._last_agent = None
         self._window_action = lambda action: None
+        self._updates = UpdateController(read_current_version(gui.resource_path('VERSION')),
+                                         self._config.parent / 'updates',
+                                         Path(sys.executable) if getattr(sys, 'frozen', False) else None)
+
+    def _start_updates(self):
+        try:
+            self._updates.check()
+        except RuntimeError:
+            pass
 
     def snapshot(self):
         """Read only. Never expose passwords, tokens, coordinates or raw school payloads."""
@@ -107,6 +120,7 @@ class DesktopBridge(LocationProbe):
             task = result.task
             return {
                 'preview': False,
+                'update': self._updates.snapshot(),
                 'location': self._location_snapshot(ds.location_source),
                 'network': {
                     'username': '' if settings.username == 'YOUR_STUDENT_ID' else settings.username,
@@ -147,6 +161,12 @@ class DesktopBridge(LocationProbe):
                 return {'ok': False, 'message': '操作未完成，请检查本机权限、配置和网络后重试。'}
 
     def _dispatch(self, action, payload):
+        if action == 'update_check':
+            return self._updates.check()
+        if action == 'update_install':
+            if self._dorm.busy or self._location_gate.locked() or self._network_gate.locked():
+                raise RuntimeError('请先停止本地后台检测，并等待当前网络、打卡或定位操作完成后，再确认安装更新。')
+            return self._updates.install(payload.get('confirmed'), payload.get('version'))
         if action == 'location_authorize':
             return self._start_location_probe(source=self._dorm.store.settings().location_source,
                                               sample_path=self._dorm.store.root / 'location-sample.json')
@@ -284,6 +304,7 @@ class DesktopBridge(LocationProbe):
     def _close(self):
         self._closed.set()
         self._stop.set()
+        self._updates.close()
         self._dorm.close()
 
 
@@ -293,8 +314,12 @@ class PreviewBridge(LocationProbe):
         self._init_location()
         self._real_location = real_location
         self._window_action = lambda action: None
+        self._update_started = None
         self._data = {
             'preview': True,
+            'update': dict(state='idle', current_version=read_current_version(gui.resource_path('VERSION')),
+                           latest_version='', progress=0, downloaded_bytes=0, total_bytes=0,
+                           checked='', busy=False, message='演示预览：更新只使用虚拟数据，不联网、不下载、不安装。'),
             'network': {'username':'2026000000', 'interval':60, 'startup':False,
                         'monitoring':False, 'busy':False, 'state':'stopped',
                         'message':'尚未检测，点击即可查看连接状态', 'checked':'', 'has_password':True},
@@ -304,6 +329,16 @@ class PreviewBridge(LocationProbe):
         }
 
     def snapshot(self):
+        if self._update_started is not None:
+            elapsed = time.monotonic() - self._update_started
+            update = self._data['update']
+            if elapsed >= 4:
+                update.update(state='ready', busy=False, progress=100, downloaded_bytes=update['total_bytes'],
+                              checked='演示', message='新版本已准备好（演示）；未下载或校验真实安装包。')
+                self._update_started = None
+            elif elapsed >= 2:
+                update.update(state='verifying', progress=100, downloaded_bytes=update['total_bytes'],
+                              message='正在演示签名校验，未运行系统校验程序。')
         return dict(copy.deepcopy(self._data),
                     location=self._location_snapshot(self._data['dorm']['settings']['location_source']),
                     location_diagnostic=self._real_location)
@@ -312,7 +347,19 @@ class PreviewBridge(LocationProbe):
         payload = payload or {}
         n, d = self._data['network'], self._data['dorm']
         try:
-            if action == 'location_authorize':
+            if action == 'update_check':
+                if self._data['update']['busy']:
+                    return {'ok': False, 'message': '演示更新正在进行，请稍候。'}
+                self._update_started = time.monotonic()
+                self._data['update'].update(state='downloading', latest_version='9.0.0', progress=35,
+                                            downloaded_bytes=36700160, total_bytes=104857600, busy=True,
+                                            message='正在演示后台下载，不会连接 GitHub 或写入安装包。')
+            elif action == 'update_install':
+                update = self._data['update']
+                if payload.get('confirmed') is not True or update['state'] != 'ready' or payload.get('version') != update['latest_version']:
+                    return {'ok': False, 'message': '请等待演示下载完成，并重新确认版本。'}
+                update.update(state='launched', busy=False, message='演示安装确认已完成；没有打开真实安装程序。')
+            elif action == 'location_authorize':
                 source = d['settings']['location_source']
                 if self._real_location and source == 'windows':
                     try:

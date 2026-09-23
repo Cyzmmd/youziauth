@@ -19,6 +19,7 @@
       <a class="nav-link" href="#network"><i class="bi bi-wifi" aria-hidden="true"></i><span>校园网</span></a>
       <a class="nav-link" href="#dorm"><i class="bi bi-journal-check" aria-hidden="true"></i><span>寝室打卡</span></a>
       <a class="nav-link" href="#records"><i class="bi bi-clock-history" aria-hidden="true"></i><span>运行记录</span></a>
+      <a class="nav-link" href="#updates" aria-label="软件更新"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i><span>软件更新</span></a>
     </nav>
     <div class="sidebar-bottom"><div class="local-note"><i class="bi bi-shield-check" aria-hidden="true"></i><span>凭据加密保存在本机<small>你的校园小助手</small></span></div><button class="text-button" data-action="hide"><i class="bi bi-window-dock" aria-hidden="true"></i> 收到托盘</button><button class="text-button" id="quit"><i class="bi bi-box-arrow-right" aria-hidden="true"></i> 退出程序</button></div>
   </aside>
@@ -26,6 +27,7 @@
     <header class="topbar"><span id="page-context">今日概览</span><div class="topbar-end"><span id="preview-tag" class="badge" hidden>演示预览</span><span id="date-label"></span><span class="topbar-divider"></span><i class="bi bi-laptop" aria-hidden="true"></i><span>本机工作台</span></div></header>
     <main id="main">
       <div id="connection-error" class="notice error" role="alert" hidden>界面暂时无法连接后台，请稍后重试。</div>
+      <div id="update-notice" class="notice update-notice" role="status" aria-live="polite" hidden><span id="update-notice-text"></span><a id="update-notice-link" href="#updates">查看软件更新 <i class="bi bi-arrow-right" aria-hidden="true"></i></a></div>
       <section class="page" id="overview" aria-labelledby="overview-title">
         <div class="eyebrow"><i class="bi bi-sun" aria-hidden="true"></i> 把日常，安排妥当</div>
         <div class="hero paper-card"><div><p class="kicker">YOUR CAMPUS COMPANION</p><h1 id="overview-title">连接校园，<br>安心过好每一天。</h1><p class="muted">校园网与寝室打卡，都在这一处。<br>把琐碎交给工具，把时间留给自己。</p></div><div class="hero-aside"><span class="little-label">今日关注</span><strong id="overview-attention">从一次连接检测开始</strong><button class="primary" data-action="network_check">检测校园网 <i class="bi bi-arrow-right" aria-hidden="true"></i></button></div></div>
@@ -75,6 +77,18 @@
       </section>
 
       <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre></article><p class="field-hint">向他人分享记录前，请检查并隐藏账号、IP 等个人信息。</p></section>
+      <section class="page" id="updates" aria-labelledby="updates-title" hidden>
+        <div class="page-heading"><div><div class="eyebrow">保持最新，安装由你确认</div><h1 id="updates-title">软件更新</h1><p class="muted">启动后在后台检查最新正式版，不影响你继续使用。</p></div><span class="section-mark"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i></span></div>
+        <article class="paper-card compact update-card">
+          <div class="card-label"><h3>版本与下载</h3><span id="update-status" class="badge">等待读取</span></div>
+          <div class="update-versions"><div class="info-row"><span>当前版本</span><strong id="update-current-version">正在读取…</strong></div><div class="info-row"><span>最新正式版</span><strong id="update-latest-version">尚未检查</strong></div></div>
+          <p id="update-message" class="muted">正在读取更新状态…</p>
+          <p id="update-checked" class="field-hint">尚未检查</p>
+          <div class="update-download"><div class="info-row"><span id="update-progress-label">下载进度</span><span id="update-download-size">尚未下载</span></div><progress id="update-progress" max="100" value="0" aria-labelledby="update-progress-label" aria-describedby="update-download-size" hidden></progress></div>
+          <div class="task-actions"><button id="check-updates" type="button" class="secondary" disabled>检查更新</button><button id="install-update" type="button" class="primary" hidden disabled>安装更新</button></div>
+        </article>
+        <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · Cyzmmd/youziauth</p><p>发现新正式版后自动下载安装包，并验证哈希与签名；不安装较旧版本。安装必须由你明确确认，不会自动退出程序。</p><p>确认后将重新验证安装包并打开安装向导。Windows 会请求管理员授权；安装期间会关闭本程序与系统代理，完成后需重新打开程序。请先保存所有设置。</p></div></article>
+      </section>
       <footer class="page-footer"><span>youziauth · 校园日常</span><span>简单一点，从容一点。</span></footer>
     </main>
   </div>

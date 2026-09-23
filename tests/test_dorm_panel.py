@@ -208,5 +208,133 @@ class GlobalLocationTests(unittest.TestCase):
                 self.api.submit.assert_not_called()
 
 
+class RenewalTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.store = Store(Path(directory.name), protector=Mock(protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
+        self.store.save_token('old-token')
+        self.controller = DormController(self.store)
+        self.addCleanup(self.controller.close)
+        self.api = Mock()
+        self.api.user.side_effect = self.identify
+        self.task = Task('task', 'form', 'publish', 'student', '2026-09-21', '测试查寝',
+                         '21:00', '23:30', False, '宿舍', '800米')
+        self.api.today.return_value = self.task
+        self.api.submit.return_value = True
+        self.controller.api = self.controller.engine.api = self.api
+        self.controller.engine.clock = lambda: dt.datetime(2026, 9, 21, 22, tzinfo=SHANGHAI)
+        self.controller.engine.location = lambda: dict(latitude=29.8, longitude=106.4, accuracy=50)
+        self.renewals = 0
+        renewal = patch('dorm_panel.login', side_effect=self.renew)
+        self.login = renewal.start()
+        self.addCleanup(renewal.stop)
+        guard = patch('socket.socket.connect', side_effect=AssertionError('Unexpected network access'))
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def identify(self, token):
+        if token == 'old-token':
+            raise CheckinError('login_required', '登录已失效')
+        return 'student'
+
+    def renew(self, store, api, cancel, *, interactive):
+        self.assertFalse(interactive)
+        self.renewals += 1
+        store.save_browser_session('renewed-token', 'student', [dict(
+            name='SSO', value='renewed-cookie', domain='idm.swu.edu.cn', path='/', expires=-1)])
+        return 'student'
+
+    def run_action(self, action):
+        self.assertTrue(self.controller.start(action))
+        deadline = time.monotonic() + 5
+        while self.controller.busy and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertFalse(self.controller.busy)
+        events = self.controller.drain()
+        return events[-1] if events else None
+
+    def test_query_renews_expired_token_without_submitting(self):
+        self.assertEqual(self.run_action('query').state, 'ready')
+        self.assertEqual(self.store.token(), 'renewed-token')
+        self.assertEqual(self.renewals, 1)
+        self.api.submit.assert_not_called()
+
+    def test_submission_renews_before_fetching_and_submits_once(self):
+        self.assertEqual(self.run_action('submit').state, 'signed')
+        self.assertEqual(self.renewals, 1)
+        self.assertEqual(self.api.submit.call_count, 1)
+        self.assertEqual(self.api.submit.call_args.args[0], 'renewed-token')
+
+    def test_automatic_renewal_does_not_get_skipped_by_tick_throttle(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.assertEqual(self.run_action('automatic').state, 'signed')
+        self.assertEqual(self.renewals, 1)
+        self.assertEqual(self.api.submit.call_count, 1)
+
+    def test_valid_token_never_launches_renewal(self):
+        self.store.save_token('valid-token')
+        self.assertEqual(self.run_action('submit').state, 'signed')
+        self.assertEqual(self.renewals, 0)
+
+    def test_renewal_failure_is_cooled_down(self):
+        def fail(*args, **kwargs):
+            self.renewals += 1
+            raise CheckinError('network_error', '暂时离线')
+        self.login.side_effect = fail
+        self.assertEqual(self.run_action('query').state, 'network_error')
+        self.assertEqual(self.run_action('query').state, 'login_required')
+        self.assertEqual(self.renewals, 1)
+        self.assertEqual(self.store.token(), 'old-token')
+
+    def test_rejected_new_token_does_not_create_a_renewal_loop(self):
+        self.api.user.side_effect = CheckinError('login_required', '仍需验证')
+        self.assertEqual(self.run_action('submit').state, 'login_required')
+        self.assertEqual(self.renewals, 1)
+        self.assertIsNone(self.store.browser_session('renewed-token'))
+        self.api.submit.assert_not_called()
+
+    def test_cancellation_during_renewal_prevents_submission(self):
+        def cancel(store, api, event, **kwargs):
+            self.renewals += 1
+            store.save_token('renewed-token')
+            event.set()
+            return 'student'
+        self.login.side_effect = cancel
+        self.assertEqual(self.run_action('submit').state, 'cancelled')
+        self.api.submit.assert_not_called()
+
+    def test_disabled_schedule_never_renews(self):
+        self.run_action('automatic')
+        self.assertEqual(self.renewals, 0)
+        self.api.user.assert_not_called()
+
+    def test_renewal_after_unknown_submission_only_reads_back(self):
+        self.store.save_token('valid-token')
+        self.api.submit.side_effect = TimeoutError()
+        self.api.is_signed.side_effect = [CheckinError('login_required', '登录已失效'), False]
+        self.assertEqual(self.run_action('submit').state, 'ready')
+        self.assertEqual(self.renewals, 1)
+        self.assertEqual(self.api.submit.call_count, 1)
+        self.assertFalse(self.store.pending(self.task.key))
+
+    def test_renewal_does_not_resubmit_a_rejected_write_in_same_action(self):
+        self.store.save_token('valid-token')
+        self.api.submit.side_effect = CheckinError('login_required', '登录已失效')
+        self.api.is_signed.return_value = False
+        self.assertEqual(self.run_action('submit').state, 'ready')
+        self.assertEqual(self.renewals, 1)
+        self.assertEqual(self.api.submit.call_count, 1)
+
+    def test_logout_clears_all_session_material_and_disables_automatic(self):
+        self.store.save_settings(Settings(enabled=True))
+        self.store.save_browser_session('old-token', 'student', [dict(name='SSO', value='cookie')])
+        self.assertEqual(self.run_action('logout').state, 'login_required')
+        self.assertEqual(self.store.token(), '')
+        self.assertIsNone(self.store.browser_session('old-token'))
+        self.assertFalse(self.store.settings().enabled)
+        self.assertEqual(self.renewals, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

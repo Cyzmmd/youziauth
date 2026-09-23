@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from campus_auth_desktop import DesktopRuntime
 from desktop_bridge import PreviewBridge
@@ -10,6 +10,20 @@ class DesktopRuntimeTests(unittest.TestCase):
         self.bridge = PreviewBridge()
         self.window = MagicMock()
         self.runtime = DesktopRuntime(self.bridge, self.window, preview=True)
+
+    def test_real_startup_checks_updates_once_and_preview_does_not(self):
+        for preview in (False, True):
+            bridge = MagicMock()
+            runtime = DesktopRuntime(bridge, MagicMock(), preview=preview)
+            runtime.events.put('show')
+            bridge._tick.side_effect = runtime.closed.set
+            with patch('campus_auth_desktop.threading.Thread'), patch('campus_auth_desktop.windows_tray.WindowsTrayIcon') as tray:
+                tray.return_value.start.return_value = False
+                runtime.run()
+            if preview:
+                bridge._start_updates.assert_not_called()
+            else:
+                bridge._start_updates.assert_called_once_with()
 
     def test_close_hides_but_does_not_exit_or_stop_background(self):
         self.bridge._close = MagicMock()

@@ -120,6 +120,7 @@ class DesktopRuntime:
             self.window.show()
             self.window.minimize()
         if not self.preview:
+            self.bridge._start_updates()
             threading.Thread(target=self._ipc, daemon=True, name='youziauth-desktop-ipc').start()
             if startup and not self.bridge._agent:
                 self.bridge.dispatch('network_start')
