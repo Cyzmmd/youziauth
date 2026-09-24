@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime as dt
+import math
 import os
 import sys
 import threading
@@ -15,10 +16,21 @@ from app_update import UpdateController, read_current_version
 import agent_ipc
 import campus_auth
 import campus_auth_gui as gui
+import dorm_points
 import windows_notifications
-from dorm_checkin import Settings
+from dorm_checkin import Settings, now
+from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pick_sample,
+                           probe_location, radius_metres)
 from dorm_panel import DormController
-from dorm_location import probe_location
+
+
+# The picker draws a real map, so tiles come from a third party. OpenStreetMap is used because it
+# needs no key and its licence is clear; the UI can switch the basemap off, and everything except
+# the tiles (grid, radius, markers, distance) keeps working offline.
+TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
+TILE_ATTRIBUTION = '© OpenStreetMap contributors'
+TILE_MAX_ZOOM = 19
+SIMULATION_SAMPLE = 'location-sample.json'
 
 
 def network_settings(payload, previous):
@@ -39,6 +51,88 @@ def dorm_settings(payload):
                     payload.get('location_source', 'windows')).validate()
 
 
+def sample_point(sample):
+    """Map-ready view of a stored simulation sample; None when it cannot be read."""
+    if not isinstance(sample, dict):
+        return None
+    try:
+        latitude, longitude = float(sample['latitude']), float(sample['longitude'])
+        accuracy = float(sample.get('accuracy', 0.0))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(latitude) and math.isfinite(longitude)):
+        return None
+    source = str(sample.get('source') or '')
+    return {'latitude': latitude, 'longitude': longitude, 'accuracy': accuracy,
+            'source': source, 'picked': source == PICK_SOURCE}
+
+
+def reference_point(task):
+    """The school's own check-in point, converted from its GCJ02 frame into WGS84 for the map."""
+    if task is None or not getattr(task, 'latitude', '') or not getattr(task, 'longitude', ''):
+        return None
+    try:
+        latitude, longitude = gcj02_to_wgs84(float(task.latitude), float(task.longitude))
+    except (TypeError, ValueError):
+        return None
+    return {'latitude': latitude, 'longitude': longitude, 'address': task.address,
+            'radius_m': radius_metres(task.radius)}
+
+
+def range_check(point, reference):
+    """Distance to the school's point and whether it is inside the radius.
+
+    Both sides are WGS84 here; the GCJ02 offset is very nearly constant across a campus, so the
+    distance is within a metre of the frame the school measures in - and the school's own verify
+    call remains the authority.
+    """
+    if not point or not reference:
+        return None, None
+    distance = distance_metres(point['latitude'], point['longitude'],
+                               reference['latitude'], reference['longitude'])
+    limit = reference.get('radius_m')
+    return distance, (None if not limit else distance <= limit)
+
+
+def saved_point_message(point, reference):
+    return '模拟定位点已保存：' + _where_message(point, reference)
+
+
+def _where_message(point, reference):
+    """Distance wording shared by every action that makes a point active."""
+    if reference is None:
+        return '先查询今日任务，即可核对与学校基准点的距离。本次未提交打卡。'
+    distance, in_range = range_check(point, reference)
+    where = f'距学校基准点约 {round(distance)} 米'
+    if in_range is False:
+        return f'{where}，超出 {reference["radius_m"]:g} 米打卡范围，学校可能拒绝。本次未提交打卡。'
+    return f'{where}，在打卡范围内。本次未提交打卡。'
+
+
+def _point_sample(point):
+    """A named point replayed as a sample: identical shape and source label to a fresh pick."""
+    return {'latitude': float(point['latitude']), 'longitude': float(point['longitude']),
+            'accuracy': float(point.get('accuracy', 100.0)), 'timestamp': time.time(),
+            'source': point.get('source') or PICK_SOURCE}
+
+
+def _same_position(sample, point):
+    """Same spot within ~0.1 m, which is all the reconciliation needs to compare files."""
+    if not sample or not point:
+        return False
+    return (abs(sample['latitude'] - float(point['latitude'])) < 1e-6
+            and abs(sample['longitude'] - float(point['longitude'])) < 1e-6)
+
+
+def _read_json(store, name):
+    """Read one store file as a location sample; anything unreadable is treated as absent."""
+    try:
+        value = store._read(name, None)
+    except (OSError, ValueError):
+        return None
+    return sample_point(value)
+
+
 class LocationProbe:
     def _init_location(self):
         self._ui_dispatch = None
@@ -57,19 +151,22 @@ class LocationProbe:
             self._reset_location(source)
         return dict(self._location_state, busy=self._location_gate.locked())
 
-    def _start_location_probe(self, *, source='windows', sample_path=None):
+    def _start_location_probe(self, *, source='windows', sample_path=None, label=''):
         if source == 'windows' and self._ui_dispatch is None:
             raise RuntimeError('请在桌面主窗口中使用定位授权功能。')
         if not self._location_gate.acquire(blocking=False):
             raise RuntimeError('正在等待授权或定位结果，请稍候。')
-        message = ('正在读取本机模拟定位样本，不会读取实时位置或提交打卡。' if source == 'simulation' else
+        message = (f'正在读取选点「{label}」的位置，不会读取实时位置或提交打卡。'
+                   if source == 'simulation' and label else
+                   '正在读取本机模拟定位样本，不会读取实时位置或提交打卡。' if source == 'simulation' else
                    '请在系统提示中选择允许，随后等待实时定位（约 30 秒内）。')
         self._location_state = {'state':'checking','message':message, 'source':source,
                                 'accuracy':None,'checked':''}
         def work():
             try:
                 self._location_state = dict(probe_location(ui_dispatch=self._ui_dispatch, source=source,
-                                                           sample_path=sample_path), source=source)
+                                                           sample_path=sample_path, label=label),
+                                            source=source)
             except Exception:
                 self._location_state = {'state':'error','message':'定位检测未完成，请检查所选来源后重试。',
                                         'source':source,'accuracy':None,'checked':''}
@@ -168,8 +265,10 @@ class DesktopBridge(LocationProbe):
                 raise RuntimeError('请先停止本地后台检测，并等待当前网络、打卡或定位操作完成后，再确认安装更新。')
             return self._updates.install(payload.get('confirmed'), payload.get('version'))
         if action == 'location_authorize':
-            return self._start_location_probe(source=self._dorm.store.settings().location_source,
-                                              sample_path=self._dorm.store.root / 'location-sample.json')
+            source = self._dorm.store.settings().location_source
+            return self._start_location_probe(source=source,
+                                              sample_path=self._dorm.store.root / 'location-sample.json',
+                                              label=self._active_point_label() if source == 'simulation' else '')
         if action == 'network_save':
             settings = network_settings(payload, gui.load_gui_settings(self._config))
             startup = payload.get('startup', False)
@@ -226,6 +325,14 @@ class DesktopBridge(LocationProbe):
             return '定位来源与自动打卡设置已保存'
         if action == 'location_source_save':
             return self._save_location_source(payload.get('location_source', ''))
+        if action == 'simulation_point_save':
+            return self._save_simulation_point(payload)
+        if action == 'simulation_point_select':
+            return self._select_simulation_point(payload)
+        if action == 'simulation_point_rename':
+            return self._rename_simulation_point(payload)
+        if action == 'simulation_point_delete':
+            return self._delete_simulation_point(payload)
         if action == 'location_settings':
             os.startfile('ms-settings:privacy-location')
             return '已打开 Windows 定位设置'
@@ -249,6 +356,153 @@ class DesktopBridge(LocationProbe):
             self._reset_location(source)
         return ('定位来源已切换为模拟定位（非实时，使用已保存样本）' if source == 'simulation'
                 else '定位来源已切换为真实定位（Windows / Wi-Fi）')
+
+    def simulation_map(self):
+        """Model for the map picker: saved points, the active one and the school's reference.
+
+        Deliberately the one place that reports coordinates to the UI, and only while the saved
+        source is 模拟定位: these are points the user chooses to submit, never a live Windows fix.
+        """
+        store = self._dorm.store
+        if store.settings().location_source != 'simulation':
+            return {'ok': False, 'message': '请先把定位来源保存为模拟定位，再使用地图选点。'}
+        state = self._sync_simulation_points(store)
+        point = sample_point(store.sample())
+        reference = reference_point(self._dorm.latest.task)
+        distance, in_range = range_check(point, reference)
+        return {'ok': True, 'point': point, 'reference': reference,
+                'distance_m': distance, 'in_range': in_range,
+                'points': [dict(entry, active=entry['id'] == state['active']) for entry in state['points']],
+                'active_id': state['active'],
+                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM}
+
+    def _sync_simulation_points(self, store):
+        """Make the list and the replayed sample agree, with the list as the source of truth.
+
+        Runs before the picker is shown and before every point action, so the two files cannot
+        drift apart - which is exactly how 1.5.2 lost a point: 恢复上一个样本 rewrote the sample
+        without telling the list. Positions the list does not hold yet are adopted instead of
+        dropped: a captured Windows fix, the 1.5.2 undo file, or a file from any older version.
+        """
+        state = store.points()
+        if not (store.root / 'location-points.json').exists():
+            # First run for this store: ship the built-in starter positions instead of an empty list.
+            state = dorm_points.seeded(now().isoformat(timespec='seconds'))
+            store.save_points(state)
+        adopted = []
+        for sample, label in ((_read_json(store, 'location-sample.previous.json'),
+                               dorm_points.PREVIOUS_SAMPLE_NAME),
+                              (sample_point(store.sample()), dorm_points.SAMPLE_NAME)):
+            if sample and dorm_points.holding(state, sample['latitude'], sample['longitude']) is None:
+                state = dorm_points.add(state, name=label, source=dorm_points.SAMPLE_SOURCE,
+                                        latitude=sample['latitude'], longitude=sample['longitude'],
+                                        accuracy=sample['accuracy'],
+                                        saved_at=now().isoformat(timespec='seconds'))
+                adopted.append(label)
+        # The mirror is what the program actually replays, so it wins the active flag.
+        mirror = sample_point(store.sample())
+        if mirror is not None:
+            held = dorm_points.holding(state, mirror['latitude'], mirror['longitude'])
+            if held is not None and held['id'] != state['active']:
+                state = dorm_points.activate(state, held['id'])
+        if not state['active'] and state['points']:
+            state = dorm_points.activate(state, state['points'][0]['id'])
+        if adopted or (store.points() != state):
+            store.save_points(state)
+        store.drop_legacy_backup()
+        active = dorm_points.find(state, state['active'])
+        if active is None:
+            if mirror is not None:
+                store.clear_sample()          # no selectable point means nothing to replay
+        elif not _same_position(mirror, active):
+            store.save_sample(_point_sample(active))
+        return state
+
+    def _active_point_label(self):
+        """The name of the point that is currently replayed, for messages that name it."""
+        state = self._sync_simulation_points(self._dorm.store)
+        active = dorm_points.find(state, state['active'])
+        return active['name'] if active else ''
+
+    def _simulation_write_guard(self):
+        store = self._dorm.store
+        if store.settings().location_source != 'simulation':
+            raise RuntimeError('请先把定位来源保存为模拟定位，再使用地图选点。')
+        if self._dorm.busy or self._location_gate.locked():
+            raise RuntimeError('请等待当前打卡或定位检测结束后，再修改模拟定位点。')
+        return store
+
+    def _save_simulation_point(self, payload):
+        store = self._simulation_write_guard()
+        self._sync_simulation_points(store)
+        try:
+            sample = map_pick_sample(payload.get('latitude'), payload.get('longitude'))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        before = store.points()
+        try:
+            state = dorm_points.add(before, name=payload.get('name'),
+                                    latitude=sample['latitude'], longitude=sample['longitude'],
+                                    accuracy=sample['accuracy'],
+                                    saved_at=now().isoformat(timespec='seconds'))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        point = dorm_points.find(state, state['active'])
+        store.save_points(state)
+        store.save_sample(_point_sample(point))
+        self._reset_location('simulation')
+        verb = (f'已更新选点「{point["name"]}」的位置'
+                if dorm_points.find(before, point['id']) else f'已新建选点「{point["name"]}」')
+        return (f'{verb}：' + _where_message(sample_point(_point_sample(point)),
+                                             reference_point(self._dorm.latest.task)))
+
+    def _select_simulation_point(self, payload):
+        store = self._simulation_write_guard()
+        self._sync_simulation_points(store)
+        try:
+            state = dorm_points.activate(store.points(), str(payload.get('id') or ''))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        point = dorm_points.find(state, state['active'])
+        store.save_points(state)
+        store.save_sample(_point_sample(point))
+        self._reset_location('simulation')
+        return (f'已切换到选点「{point["name"]}」：'
+                + _where_message(sample_point(_point_sample(point)),
+                                 reference_point(self._dorm.latest.task)))
+
+    def _rename_simulation_point(self, payload):
+        store = self._simulation_write_guard()
+        self._sync_simulation_points(store)
+        try:
+            state = dorm_points.rename(store.points(), str(payload.get('id') or ''), payload.get('name'))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        store.save_points(state)
+        return f'选点已重命名为「{dorm_points.find(state, str(payload.get("id") or ""))["name"]}」。'
+
+    def _delete_simulation_point(self, payload):
+        store = self._simulation_write_guard()
+        state = self._sync_simulation_points(store)
+        point = dorm_points.find(state, str(payload.get('id') or ''))
+        try:
+            remaining = dorm_points.remove(state, str(payload.get('id') or ''))
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
+        if remaining['points'] and not remaining['active']:
+            remaining = dorm_points.activate(remaining, remaining['points'][0]['id'])
+        store.save_points(remaining)
+        active = dorm_points.find(remaining, remaining['active'])
+        label = point['name'] if point else ''
+        if active is None:
+            store.clear_sample()
+            self._reset_location('simulation')
+            return (f'已删除选点「{label}」：模拟定位现在没有可用位置，自动打卡会因缺少位置而跳过；'
+                    '请在地图上重新选点。')
+        store.save_sample(_point_sample(active))
+        self._reset_location('simulation')
+        return (f'已删除选点「{label}」，已自动切换到「{active["name"]}」。'
+                if active['id'] != (point or {}).get('id') else f'已删除选点「{label}」。')
 
     def _agent_command(self, command):
         agent_ipc.send_command('youziauth-agent', agent_ipc.AgentCommand(command), timeout_ms=3000)
@@ -325,8 +579,98 @@ class PreviewBridge(LocationProbe):
                         'message':'尚未检测，点击即可查看连接状态', 'checked':'', 'has_password':True},
             'dorm': {'state':'idle', 'message':'查询今日任务，开始今晚的安排', 'busy':False,
                      'settings':dataclasses.asdict(Settings()), 'schedule':'自动打卡：关闭', 'task':None},
+            'simulation': {'point': {'latitude': 29.823693, 'longitude': 106.422310},
+                           'points': dorm_points.add(
+                               dorm_points.empty(), name='演示·宿舍楼下',
+                               latitude=29.823693, longitude=106.422310, accuracy=100.0,
+                               saved_at=now().isoformat(timespec='seconds'))},
             'logs': {'network':'', 'dorm':''},
         }
+
+    def _preview_reference(self):
+        """Fixed demo check-in point, in the same WGS84 frame the picker works in."""
+        return {'latitude': 29.823940, 'longitude': 106.422470,
+                'address': '示例宿舍（演示）', 'radius_m': 800.0}
+
+    def simulation_map(self):
+        if self._data['dorm']['settings']['location_source'] != 'simulation':
+            return {'ok': False, 'message': '请先把定位来源保存为模拟定位，再使用地图选点。'}
+        sample = self._data['simulation']['point']
+        point = sample_point(dict(sample, accuracy=sample.get('accuracy', 100.0),
+                                  source=sample.get('source', PICK_SOURCE)))
+        reference = self._preview_reference()
+        distance, in_range = range_check(point, reference)
+        named = self._data['simulation']['points']
+        return {'ok': True, 'point': point, 'reference': reference,
+                'distance_m': distance, 'in_range': in_range,
+                'points': [dict(entry, active=entry['id'] == named['active']) for entry in named['points']],
+                'active_id': named['active'],
+                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM}
+
+    def _preview_points(self):
+        return self._data['simulation']['points']
+
+    def _save_preview_point(self, payload):
+        if self._data['dorm']['settings']['location_source'] != 'simulation':
+            return {'ok': False, 'message': '请先把定位来源保存为模拟定位，再使用地图选点。'}
+        before = self._preview_points()
+        try:
+            sample = map_pick_sample(payload.get('latitude'), payload.get('longitude'))
+            state = dorm_points.add(before, name=payload.get('name'),
+                                    latitude=sample['latitude'], longitude=sample['longitude'],
+                                    accuracy=sample['accuracy'],
+                                    saved_at=now().isoformat(timespec='seconds'))
+        except ValueError as exc:
+            return {'ok': False, 'message': str(exc)}
+        simulation = self._data['simulation']
+        point = dorm_points.find(state, state['active'])
+        simulation['point'] = _point_sample(point)
+        simulation['points'] = state
+        verb = (f'已更新选点「{point["name"]}」的位置'
+                if dorm_points.find(before, point['id']) else f'已新建选点「{point["name"]}」')
+        return {'ok': True, 'message': f'演示：{verb}：'
+                                       + _where_message(sample_point(_point_sample(point)),
+                                                        self._preview_reference())}
+
+    def _select_preview_point(self, point_id):
+        try:
+            state = dorm_points.activate(self._preview_points(), str(point_id or ''))
+        except ValueError as exc:
+            return {'ok': False, 'message': str(exc)}
+        point = dorm_points.find(state, state['active'])
+        simulation = self._data['simulation']
+        simulation['point'] = _point_sample(point)
+        simulation['points'] = state
+        return {'ok': True, 'message': f'演示：已切换到选点「{point["name"]}」：'
+                                       + _where_message(sample_point(_point_sample(point)),
+                                                        self._preview_reference())}
+
+    def _rename_preview_point(self, payload):
+        try:
+            state = dorm_points.rename(self._preview_points(), str(payload.get('id') or ''), payload.get('name'))
+        except ValueError as exc:
+            return {'ok': False, 'message': str(exc)}
+        self._data['simulation']['points'] = state
+        return {'ok': True, 'message': f'演示：选点已重命名为「{dorm_points.find(state, str(payload.get("id") or ""))["name"]}」。'}
+
+    def _delete_preview_point(self, point_id):
+        state = self._preview_points()
+        point = dorm_points.find(state, str(point_id or ''))
+        try:
+            remaining = dorm_points.remove(state, str(point_id or ''))
+        except ValueError as exc:
+            return {'ok': False, 'message': str(exc)}
+        if remaining['points'] and not remaining['active']:
+            remaining = dorm_points.activate(remaining, remaining['points'][0]['id'])
+        simulation = self._data['simulation']
+        simulation['points'] = remaining
+        active = dorm_points.find(remaining, remaining['active'])
+        label = point['name'] if point else ''
+        if active is None:
+            return {'ok': True, 'message': f'演示：已删除选点「{label}」：模拟定位现在没有可用位置，'
+                                           '自动打卡会因缺少位置而跳过；请在地图上重新选点。'}
+        simulation['point'] = _point_sample(active)
+        return {'ok': True, 'message': f'演示：已删除选点「{label}」，已自动切换到「{active["name"]}」。'}
 
     def snapshot(self):
         if self._update_started is not None:
@@ -366,7 +710,9 @@ class PreviewBridge(LocationProbe):
                         return {'ok':True,'message':self._start_location_probe()}
                     except RuntimeError as exc:
                         return {'ok':False,'message':str(exc)}
-                message = ('模拟定位检测通过（演示）；未读取本机样本或实时位置。' if source == 'simulation' else
+                active = dorm_points.find(self._preview_points(), self._preview_points()['active'])
+                named = f'当前使用选点「{active["name"]}」，' if source == 'simulation' and active else ''
+                message = (f'模拟定位检测通过（演示）：{named}未读取本机样本或实时位置。' if source == 'simulation' else
                            '定位检测通过（演示）；未读取真实位置。')
                 self._location_state = {'state':'ready','message':message,'source':source,
                                         'accuracy':50,'checked':'演示'}
@@ -388,6 +734,14 @@ class PreviewBridge(LocationProbe):
                 if source != d['settings']['location_source']:
                     self._reset_location(source)
                     d['settings']['location_source'] = source
+            elif action == 'simulation_point_save':
+                return self._save_preview_point(payload)
+            elif action == 'simulation_point_select':
+                return self._select_preview_point(payload.get('id'))
+            elif action == 'simulation_point_rename':
+                return self._rename_preview_point(payload)
+            elif action == 'simulation_point_delete':
+                return self._delete_preview_point(payload.get('id'))
             elif action == 'dorm_save':
                 if self._location_gate.locked():
                     return {'ok':False, 'message':'请等待定位检测完成后再保存设置。'}

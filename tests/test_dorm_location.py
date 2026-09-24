@@ -12,7 +12,9 @@ from dorm_checkin import CheckinError
 
 PRESENT = importlib.util.find_spec('dorm_location') is not None
 if PRESENT:
-    from dorm_location import validate_position, wgs84_to_gcj02
+    from dorm_location import (PICK_ACCURACY_M, distance_metres, gcj02_to_wgs84, map_pick_sample,
+                               probe_location, radius_metres, simulate_location, validate_position,
+                               wgs84_to_gcj02)
 
 
 def metres_between(lat_a, lng_a, lat_b, lng_b):
@@ -274,6 +276,71 @@ class SimulatedLocationCliTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertEqual(result['state'], 'inaccurate')
         self.assertNotIn('position', result)
+
+
+@unittest.skipUnless(PRESENT, 'dorm_location is not implemented')
+class MapPickTests(unittest.TestCase):
+    """Helpers behind the map picker: datum round-trip, radius text and the pick sample."""
+
+    def test_gcj02_round_trip_is_sub_metre(self):
+        for point in ((29.823693, 106.422310), (39.908823, 116.397470), (22.543099, 114.057868)):
+            with self.subTest(point=point):
+                back = gcj02_to_wgs84(*wgs84_to_gcj02(*point))
+                self.assertLess(distance_metres(point[0], point[1], back[0], back[1]), 1.0)
+
+    def test_coordinates_outside_china_are_never_shifted(self):
+        self.assertEqual(gcj02_to_wgs84(48.8584, 2.2945), (48.8584, 2.2945))
+
+    def test_distance_matches_the_independent_haversine(self):
+        self.assertAlmostEqual(distance_metres(29.823693, 106.422310, 29.821186, 106.426239),
+                               metres_between(29.823693, 106.422310, 29.821186, 106.426239), places=6)
+
+    def test_radius_text_is_read_like_the_school_writes_it(self):
+        for text, expected in (('800米', 800.0), ('800', 800.0), ('500 米', 500.0), (600, 600.0)):
+            with self.subTest(text=text):
+                self.assertEqual(radius_metres(text), expected)
+        for unusable in ('', None, '以学校任务为准'):
+            with self.subTest(text=unusable):
+                self.assertIsNone(radius_metres(unusable))
+
+    def test_a_pick_replays_exactly_like_a_captured_fix(self):
+        sample = map_pick_sample(29.823693, 106.422310)
+        self.assertEqual(sample['source'], 'MAP_PICK')
+        self.assertEqual(sample['accuracy'], PICK_ACCURACY_M)
+        position = simulate_location(sample)
+        expected = wgs84_to_gcj02(29.823693, 106.422310)
+        for key in ('latitude', 'longitude', 'accuracy', 'time', 'provider', 'isOffset', 'errorCode'):
+            self.assertIn(key, position)
+        self.assertLess(metres_between(position['latitude'], position['longitude'], *expected), 26.0)
+
+    def test_a_pick_is_never_submitted_as_a_raw_wgs84_point(self):
+        sample = map_pick_sample(29.823693, 106.422310)
+        position = simulate_location(sample)
+        self.assertGreater(metres_between(position['latitude'], position['longitude'],
+                                          29.823693, 106.422310), 400.0)
+
+    def test_unusable_picks_are_refused(self):
+        for latitude, longitude in ((None, 106.4), ('north', 106.4), (91.0, 106.4), (29.8, 181.0),
+                                    (float('nan'), 106.4), (float('inf'), 106.4)):
+            with self.subTest(pick=(latitude, longitude)), self.assertRaises(ValueError):
+                map_pick_sample(latitude, longitude)
+
+    def test_the_simulation_probe_names_the_point_it_used(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sample_path = Path(directory) / 'sample.json'
+            sample_path.write_text(json.dumps(map_pick_sample(29.823693, 106.422310)),
+                                   encoding='utf-8')
+            named = probe_location(source='simulation', sample_path=sample_path, label='杏园三舍')
+            self.assertEqual(named['state'], 'ready')
+            self.assertIn('当前使用选点「杏园三舍」', named['message'])
+            self.assertIn('未提交打卡', named['message'])
+            unnamed = probe_location(source='simulation', sample_path=sample_path)
+            self.assertEqual(unnamed['state'], 'ready')
+            self.assertNotIn('选点「', unnamed['message'])
+
+    def test_a_pick_that_cannot_pass_the_acceptance_limit_is_refused(self):
+        with self.assertRaises(ValueError):
+            map_pick_sample(29.823693, 106.422310, accuracy=600)
 
 
 if __name__ == '__main__':

@@ -142,11 +142,18 @@ class SwuApi:
                     fields.setdefault('qsqddd', str(item['address']))
                 if item.get('qdbj'):
                     fields.setdefault('qdbj', str(item['qdbj']) + '米')
+                # The school also states where its own check-in point is; the map picker needs it
+                # to centre and to draw the acceptance radius. Absent on older forms.
+                if item.get('latitude'):
+                    fields.setdefault('latitude', str(item['latitude']))
+                if item.get('longitude'):
+                    fields.setdefault('longitude', str(item['longitude']))
         return Task(task_id, form_id, publish_id, student, record['tsrq'],
                     str(record.get('cqzmc') or record.get('title') or '今日查寝')[:120],
                     times[0], times[1], str(data.get('qdjg')) == '1',
                     fields.get('qsqddd') or str(data.get('qsqddd') or ''),
-                    fields.get('qdbj') or str(data.get('qdbj') or ''), str(data.get('formId') or ''))
+                    fields.get('qdbj') or str(data.get('qdbj') or ''), str(data.get('formId') or ''),
+                    fields.get('latitude') or '', fields.get('longitude') or '')
 
     def verify(self, token, task, position):
         data = self.transport('POST', BASE + 'cqlc/verify', token,

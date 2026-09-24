@@ -76,6 +76,19 @@ class ApiTests(unittest.TestCase):
         self.replies = [dict(self.selected, qdjg='1')]
         self.assertTrue(self.api.is_signed('secret', task))
 
+    def test_dormitory_reference_point_is_captured_for_the_map(self):
+        self.replies[2] = dict(columnList=[dict(address='宿舍', latitude='29.821186',
+                                                longitude='106.426239', qdbj=800)])
+        task = self.api.today('secret', 'student', self.current)
+        self.assertEqual(task.latitude, '29.821186')
+        self.assertEqual(task.longitude, '106.426239')
+        self.assertEqual(task.address, '宿舍')
+        self.assertEqual(task.radius, '800米')
+
+    def test_a_form_without_a_reference_point_still_produces_a_task(self):
+        task = self.api.today('secret', 'student', self.current)
+        self.assertEqual((task.latitude, task.longitude), ('', ''))
+
     def test_submit_reports_the_confirmation_the_school_writes_back(self):
         task = self.api.today('secret', 'student', self.current)
         self.replies = [dict(qdjg='1')]
