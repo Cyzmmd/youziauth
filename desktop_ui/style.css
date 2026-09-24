@@ -27,4 +27,29 @@
 .update-policy p+p{margin-top:7px}
 @media(max-width:760px){.update-notice{align-items:flex-start;flex-direction:column}.update-versions{grid-template-columns:1fr}.update-card .card-label{flex-wrap:wrap}}
 
-.location-check{padding:12px 14px;border:1px solid var(--border);border-radius:9px;margin:15px 0;background:rgba(232,236,240,.45);font-size:12px}.location-check small{display:block;margin-top:7px;color:var(--muted);font-size:10px}.location-success{color:var(--green)}.location-error{color:var(--red)}.location-settings{margin-top:12px}.location-source-settings{border-top:1px solid var(--border);margin-top:24px;padding-top:19px}.location-source-settings label{margin-top:0}.location-source-card label{margin-top:15px}.location-source-card select{width:100%}.location-source-card .badge{display:block;margin-top:11px;text-align:center}
+.location-check{padding:12px 14px;border:1px solid var(--border);border-radius:9px;margin:15px 0;background:rgba(232,236,240,.45);font-size:12px}.location-check small{display:block;margin-top:7px;color:var(--muted);font-size:10px}.location-success{color:var(--green)}.location-error{color:var(--red)}.location-settings{margin-top:12px}.location-source-settings{border-top:1px solid var(--border);margin-top:24px;padding-top:19px}.location-source-settings label{margin-top:0}.location-source-card label{margin-top:15px}.location-source-card select{width:100%}
+.location-source-card #save-location-source{margin-top:12px}
+.location-source-card #open-map-picker{margin-top:12px}
+
+.map-dialog{width:780px;max-width:94vw;max-height:92vh;padding:0;border:0;border-radius:14px;background:transparent;color:var(--ink)}
+.map-dialog::backdrop{background:rgba(41,51,62,.42)}
+.map-dialog .map-card{background:var(--surface);max-height:92vh;overflow:auto;box-shadow:0 18px 48px rgba(20,28,36,.28)}
+.map-card .field-hint{margin:7px 0 0}
+.map-points{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 10px;align-items:center;margin-top:14px}
+.map-point-edit{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:8px;align-items:center;margin-top:10px}
+.map-points label,.map-point-edit label{font-size:12px;color:var(--muted);margin:0}
+.map-points select,.map-point-edit input{width:100%}
+.map-points .field-hint{grid-column:1/-1;margin:0}
+.map-point-edit button{padding:7px 11px;font-size:12px}
+.map-point-edit .field-hint{grid-column:1/-1;margin:0}
+.map-frame{position:relative;margin-top:12px}
+.map-frame canvas{display:block;width:100%;height:auto;border:1px solid var(--border);border-radius:9px;background:#eef1f4;cursor:grab;touch-action:none}
+.map-frame canvas.dragging{cursor:grabbing}
+.map-frame canvas:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.map-frame .badge{position:absolute;top:10px;left:10px;background:rgba(255,254,250,.92)}
+.map-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.map-controls button{padding:7px 11px;font-size:12px}
+.map-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.map-toggle input{margin:0}
+.map-card .form-footer{margin-top:14px;border-top:1px solid var(--border);padding-top:14px}
+.map-card .text-button{margin-top:10px}

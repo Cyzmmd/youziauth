@@ -20,6 +20,9 @@ function harness(source='windows'){
       id,tagName:match[1].toUpperCase(),value:attributes.value||'',checked:false,
       hidden:/\shidden(?:\s|$)/.test(match[2]),disabled:/\sdisabled(?:\s|$)/.test(match[2]),open:false,
       textContent:'',firstChild:{textContent:''},dataset:action?{action}:{},attributes,hash:attributes.href||'',
+      options:[],children:[],
+      appendChild(child){this.children.push(child);if(child.tagName==='OPTION')this.options.push(child);return child;},
+      replaceChildren(...nodes){this.children=nodes;this.options=nodes.filter(node=>node.tagName==='OPTION');},
       set innerHTML(value){assert.fail('Backend text must never be rendered as HTML: '+value);},
       classList:{toggle(name,on){if(on)classes.add(name);else classes.delete(name);},contains(name){return classes.has(name);}},
       listeners:{},addEventListener(event,fn){this.listeners[event]=fn;},
@@ -42,16 +45,63 @@ function harness(source='windows'){
   const stop=actions.find(button=>button.dataset.action==='network_stop');
   const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:'',dorm:''}};
   const calls=[];
+  const map={ok:true,point:{latitude:29.823693,longitude:106.422310,accuracy:100,source:'MAP_PICK',picked:true},
+    reference:{latitude:29.823940,longitude:106.422470,address:'示例宿舍',radius_m:800},
+    distance_m:31.6,in_range:true,
+    points:[{id:'p1',name:'本机采样样本',latitude:29.823693,longitude:106.422310,accuracy:100,
+             source:'SAMPLE',saved_at:'2026-09-24T09:40:00+08:00',active:true}],
+    active_id:'p1',
+    tile_url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',attribution:'© OpenStreetMap contributors',max_zoom:19};
   const api={snapshot:async()=>structuredClone(data),dispatch:async(action,payload)=>{
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
     if(action==='location_source_save')data.dorm.settings.location_source=payload.location_source;
+    if(action==='simulation_point_save'){
+      if(payload.latitude===null||typeof payload.latitude!=='number')return {ok:false,message:'选点坐标无效，请在地图上重新选择。'};
+      const named=payload.name||'选点 2';
+      const existing=map.points.find(point=>point.name===named);
+      map.points=map.points.map(point=>({...point,active:false,
+        ...(existing&&point.id===existing.id?{latitude:payload.latitude,longitude:payload.longitude}:{})}));
+      if(existing){map.active_id=existing.id;}
+      else{
+        map.points.push({id:'p'+(map.points.length+1),name:named,latitude:payload.latitude,
+                         longitude:payload.longitude,accuracy:100,source:'MAP_PICK',
+                         saved_at:'2026-09-24T10:00:00+08:00',active:true});
+        map.active_id=map.points[map.points.length-1].id;
+      }
+      const chosen=map.points.find(point=>point.id===map.active_id);
+      map.point={latitude:chosen.latitude,longitude:chosen.longitude,accuracy:100,source:'MAP_PICK',picked:true};
+    }
+    if(action==='simulation_point_select'){
+      map.points=map.points.map(point=>({...point,active:point.id===payload.id}));
+      const chosen=map.points.find(point=>point.active);
+      if(!chosen)return {ok:false,message:'找不到这个选点，请刷新后重试。'};
+      map.active_id=chosen.id;
+      map.point={latitude:chosen.latitude,longitude:chosen.longitude,accuracy:100,
+                 source:chosen.source,picked:true};
+    }
+    if(action==='simulation_point_rename'){
+      if(!payload.name)return {ok:false,message:'名称不能为空，最多 24 个字。'};
+      map.points=map.points.map(point=>point.id===payload.id?{...point,name:payload.name}:point);
+    }
+    if(action==='simulation_point_delete'){
+      map.points=map.points.filter(point=>point.id!==payload.id);
+      if(map.active_id===payload.id){
+        map.active_id=map.points.length?map.points[0].id:'';
+        map.points=map.points.map(point=>({...point,active:point.id===map.active_id}));
+        const chosen=map.points.find(point=>point.active);
+        if(chosen)map.point={latitude:chosen.latitude,longitude:chosen.longitude,accuracy:100,
+                             source:chosen.source,picked:true};
+      }
+    }
     return {ok:true,message:'操作完成'};
-  }};
+  },simulation_map:async()=>structuredClone(map)};
   const context=vm.createContext({console,URLSearchParams,Intl,Date,Promise,
     location:{hash:'#network',search:''},setInterval(){},setTimeout(){},clearTimeout(){},
     window:{addEventListener(){},scrollTo(){},pywebview:{api}},
-    document:{getElementById:id=>elements.get(id)||null,querySelectorAll:selector=>{
+    document:{getElementById:id=>elements.get(id)||null,
+      createElement(tag){return {tagName:String(tag).toUpperCase(),value:'',textContent:'',selected:false};},
+      querySelectorAll:selector=>{
       if(selector==='[data-action]')return actions;
       if(selector==='.nav-link')return navigation;
       const selected=[...selector.matchAll(/\[data-action="([^"]+)"\]/g)].map(m=>m[1]);
@@ -61,7 +111,7 @@ function harness(source='windows'){
     }},
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../desktop_ui/app.js'),'utf8'),context);
-  return {el,data,api,calls,context,stop,navigation,refresh:()=>vm.runInContext('refresh()',context),navigate(page){context.location.hash='#'+page;vm.runInContext('navigate()',context);}};
+  return {el,data,api,map,calls,context,stop,navigation,refresh:()=>vm.runInContext('refresh()',context),navigate(page){context.location.hash='#'+page;vm.runInContext('navigate()',context);}};
 }
 const settle=()=>new Promise(resolve=>setImmediate(resolve));
 function pickSource(h,source){h.el('location-source').value=source;h.el('location-source').listeners.change();}function saveSource(h){return h.el('save-location-source').listeners.click();}
@@ -170,7 +220,7 @@ test('saving the source sends only the source and keeps the schedule untouched',
   assert.deepEqual(JSON.parse(JSON.stringify(h.calls[0].payload)),{location_source:'simulation'});
   assert.equal(h.el('location-source').value,'simulation');
   assert.equal(h.el('dorm-save-state').textContent,'设置已同步');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
   assert.match(h.el('overview-location-source').textContent,/模拟/);
 });
 
@@ -182,7 +232,7 @@ test('saving the schedule alone never rewrites the saved location source',async(
   assert.equal(h.calls[0].action,'dorm_save');
   assert.equal('location_source' in h.calls[0].payload,false);
   assert.equal(h.data.dorm.settings.location_source,'simulation');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
 });
 
 test('the source save button stays idle until the draft differs from the saved source',async()=>{
@@ -198,7 +248,7 @@ test('refresh preserves a source draft but labels and detection use the saved so
   const h=harness();await settle();
   pickSource(h,'simulation');await h.refresh();
   assert.equal(h.el('location-source').value,'simulation');
-  assert.match(h.el('location-source-badge').textContent,/真实.*Windows/);
+  assert.match(h.el('overview-location-source').textContent,/真实.*Windows/);
   assert.equal(h.el('authorize-location').textContent,'授权并检测定位');
   assert.equal(h.calls.length,0);
 });
@@ -211,7 +261,7 @@ test('a source edit during save survives and the accepted source drives the labe
   pickSource(h,'windows');complete();await saving;
   assert.equal(h.el('location-source').value,'windows');
   assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
   h.el('authorize-location').listeners.click();await settle();
   assert.match(h.el('toast').textContent,/先保存.*来源/);
 });
@@ -222,7 +272,7 @@ test('failed source save keeps the draft while the saved source remains real',as
   pickSource(h,'simulation');await saveSource(h);
   assert.equal(h.el('location-source').value,'simulation');
   assert.equal(h.el('dorm-save-state').textContent,'有未保存的修改');
-  assert.match(h.el('location-source-badge').textContent,/真实/);
+  assert.match(h.el('overview-location-source').textContent,/真实/);
 });
 
 test('saved simulation stays dirty and blocks location actions until its snapshot recovers',async()=>{
@@ -246,7 +296,7 @@ test('saved simulation stays dirty and blocks location actions until its snapsho
   h.api.snapshot=snapshot;await h.refresh();
   assert.equal(h.el('connection-error').hidden,true);
   assert.equal(h.el('location-source').value,'simulation');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
   assert.equal(h.el('authorize-location').disabled,false);
   assert.equal(h.el('submit-dorm').disabled,false);
   assert.deepEqual(h.calls.map(call=>call.action),['location_source_save']);
@@ -273,7 +323,7 @@ test('a failed snapshot blocks even a matching source and recovery reads the rea
 
   h.data.dorm.settings.location_source='simulation';h.api.snapshot=snapshot;await h.refresh();
   assert.equal(h.el('location-source').value,'simulation');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
   assert.equal(h.el('connection-error').hidden,true);
   assert.equal(h.el('authorize-location').disabled,false);
   assert.equal(h.el('submit-dorm').disabled,false);
@@ -282,8 +332,10 @@ test('a failed snapshot blocks even a matching source and recovery reads the rea
 test('simulation detection is clearly non-live and requires no Windows permission',async()=>{
   const h=harness('simulation');await settle();
   assert.equal(h.el('authorize-location').textContent,'检测模拟定位');
-  assert.match(h.el('location-source-badge').textContent,/模拟/);
-  assert.equal(h.el('location-source-badge').className,'badge full warning');
+  assert.match(h.el('overview-location-source').textContent,/模拟/);
+  // 定位来源卡片只保留选择器、保存按钮与检测框：说明行与来源徽标已删除。
+  const markup=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.doesNotMatch(markup,/location-source-badge|location-source-scope/);
   // 冗长的模拟定位说明已移除：模拟模式下不再显示任何模式说明文字。
   assert.equal(h.el('location-mode-hint').hidden,true);
   h.el('authorize-location').listeners.click();await settle();
@@ -305,8 +357,8 @@ test('saving Windows restores real detection and explains Windows chooses the so
   assert.equal(h.calls[0].action,'location_source_save');
   assert.equal(h.calls[0].payload.location_source,'windows');
   assert.equal(h.el('authorize-location').textContent,'授权并检测定位');
-  assert.match(h.el('location-source-badge').textContent,/真实.*Windows/);
-  assert.doesNotMatch(h.el('location-source-badge').textContent,/模拟/);
+  assert.match(h.el('overview-location-source').textContent,/真实.*Windows/);
+  assert.doesNotMatch(h.el('overview-location-source').textContent,/模拟/);
   assert.match(h.el('location-mode-hint').textContent,/Windows.*决定/);
   assert.match(h.el('location-mode-hint').textContent,/不保证.*Wi-Fi/);
   assert.equal(h.el('location-mode-hint').hidden,false);
@@ -721,4 +773,248 @@ test('release messages and version strings are rendered literally, never as clou
   assert.equal(h.el('update-notice-link').attributes.href,'#updates');
   h.el('confirm-cancel').onclick();
   assert.equal(h.calls.length,0);
+});
+
+/* Simulation map picker ------------------------------------------------------------------- */
+const mapZoom=h=>vm.runInContext('mapState?mapState.zoom:null',h.context);
+const mapCentre=h=>vm.runInContext('mapState?mapState.center:null',h.context);
+const mapPicked=h=>vm.runInContext('mapState?mapState.picked:null',h.context);
+async function openMap(h){
+  assert.equal(h.el('open-map-picker').hidden,false);
+  h.el('open-map-picker').onclick();
+  await settle();await settle();
+}
+function clickMap(h,x,y){h.el('map-canvas').listeners.click({offsetX:x,offsetY:y});}
+
+test('the picker stays closed until it is opened, and only in simulation mode',async()=>{
+  const windows=harness('windows');await settle();
+  assert.equal(windows.el('open-map-picker').hidden,true);
+  windows.el('open-map-picker').onclick();await settle();await settle();
+  assert.equal(windows.el('map-dialog').open,false);
+  assert.equal(windows.calls.filter(c=>c.action.startsWith('simulation')).length,0);
+
+  const h=harness('simulation');await settle();
+  assert.equal(h.el('open-map-picker').hidden,false);
+  assert.equal(h.el('map-dialog').open,false);
+  await openMap(h);
+  assert.equal(h.el('map-dialog').open,true);
+  assert.equal(h.el('open-map-picker').hidden,true);
+  assert.match(h.el('map-summary').textContent,/示例宿舍/);
+  assert.equal(h.el('map-save').disabled,true);
+  assert.match(h.el('map-distance-badge').textContent,/^已保存 · 距基准点 \d+ 米（范围内）$/);
+});
+
+test('clicking the map picks a point and saving sends those coordinates',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  clickMap(h,320,180);
+  assert.ok(Math.abs(mapPicked(h).latitude-29.823940)<0.00005);
+  assert.ok(Math.abs(mapPicked(h).longitude-106.422470)<0.00005);
+  assert.equal(h.el('map-save').disabled,false);
+  assert.match(h.el('map-distance-badge').textContent,/^待保存 · 距基准点 0 米（范围内）$/);
+  h.el('map-point-name').value='宿舍楼下';
+  h.el('map-save').onclick();await settle();await settle();
+  const save=h.calls.find(c=>c.action==='simulation_point_save');
+  assert.ok(save,'saving must reach the bridge');
+  assert.ok(Math.abs(save.payload.latitude-29.823940)<0.00005);
+  assert.ok(Math.abs(save.payload.longitude-106.422470)<0.00005);
+  assert.equal(mapPicked(h),null);
+  assert.match(h.el('map-distance-badge').textContent,/^已保存 · /);
+  assert.equal(h.el('map-points').options.length,2);
+});
+
+test('a pick outside the allowed radius is labelled before it is saved',async()=>{
+  const h=harness('simulation');await settle();
+  h.map.reference.radius_m=50;
+  await openMap(h);
+  clickMap(h,320,100);
+  assert.match(h.el('map-distance-badge').textContent,/待保存 · 距基准点 \d+ 米（超出范围）$/);
+  assert.equal(h.el('map-save').disabled,false);
+});
+
+test('saving is impossible without a pick',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  h.el('map-save').onclick();await settle();
+  assert.equal(h.calls.length,0);
+});
+
+test('zoom is clamped and recentring returns to the school point',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  for(let i=0;i<12;i++)h.el('map-zoom-out').onclick();
+  assert.equal(mapZoom(h),13);
+  for(let i=0;i<12;i++)h.el('map-zoom-in').onclick();
+  assert.equal(mapZoom(h),19);
+  h.el('map-canvas').listeners.keydown({key:'ArrowUp',shiftKey:true,preventDefault(){}});
+  assert.ok(Math.abs(mapCentre(h).latitude-29.823940)>0.001);
+  h.el('map-recenter').onclick();
+  assert.ok(Math.abs(mapCentre(h).latitude-29.823940)<1e-9);
+  assert.ok(Math.abs(mapCentre(h).longitude-106.422470)<1e-9);
+});
+
+test('the basemap can be switched off without losing the picker',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  h.el('map-tiles').checked=true;h.el('map-tiles').listeners.change();
+  assert.equal(vm.runInContext('mapCredit(mapState)',h.context),'© OpenStreetMap contributors',
+               'the map data keeps its credit, drawn on the canvas instead of a paragraph');
+  h.el('map-tiles').checked=false;h.el('map-tiles').listeners.change();
+  assert.equal(vm.runInContext('mapCredit(mapState)',h.context),'',
+               'no basemap means no third-party data to credit');
+  assert.equal(h.el('map-dialog').open,true);
+  // 冗长的底图说明段落已删除，只留画布上的一行署名。
+  const markup=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  assert.doesNotMatch(markup,/map-attribution/);
+});
+
+test('the picker still works before the school publishes a point',async()=>{
+  const h=harness('simulation');await settle();
+  h.map.reference=null;
+  await openMap(h);
+  assert.match(h.el('map-summary').textContent,/尚未查询今日任务/);
+  assert.match(h.el('map-distance-badge').textContent,/^已保存 · 距基准点未知$/);
+  clickMap(h,320,180);
+  assert.equal(h.el('map-save').disabled,false);
+  assert.match(h.el('map-distance-badge').textContent,/^待保存 · 距基准点未知$/);
+  h.el('map-save').onclick();await settle();await settle();
+  assert.ok(h.calls.some(c=>c.action==='simulation_point_save'));
+});
+
+test('the basemap host is allowed by the content security policy',async()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  const csp=html.match(/Content-Security-Policy" content="([^"]+)"/)[1];
+  const imagePolicy=csp.split(';').map(part=>part.trim()).find(part=>part.startsWith('img-src'));
+  assert.ok(imagePolicy,'the page must state an img-src policy');
+  assert.match(imagePolicy,/'self'/, 'same-origin images stay allowed');
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  const host=new URL(h.map.tile_url.replace('{z}','17').replace('{x}','1').replace('{y}','1')).host;
+  assert.ok(imagePolicy.includes(host),'img-src must name the basemap host '+host);
+  assert.equal((csp.match(/https:\/\//g)||[]).length,1,'the picker adds exactly one remote origin');
+});
+
+test('dragging pans the map and never drops a marker',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  const canvas=h.el('map-canvas'),before=mapCentre(h);
+  canvas.listeners.pointerdown({offsetX:360,offsetY:200,pointerId:1});
+  canvas.listeners.pointermove({offsetX:300,offsetY:200,pointerId:1});
+  canvas.listeners.pointerup({offsetX:300,offsetY:200,pointerId:1});
+  const after=mapCentre(h);
+  assert.ok(after.longitude>before.longitude,'dragging left moves the view east');
+  assert.ok(after.latitude-before.latitude<1e-9,'a horizontal drag does not tilt the view');
+  assert.equal(mapPicked(h),null,'a drag is not a pick');
+  canvas.listeners.click({offsetX:300,offsetY:200});
+  assert.equal(mapPicked(h),null,'the click that ends a drag is swallowed');
+  canvas.listeners.click({offsetX:320,offsetY:180});
+  assert.ok(mapPicked(h),'a plain click still picks');
+});
+
+test('the wheel zooms and stays inside the allowed range',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  const canvas=h.el('map-canvas'),start=mapZoom(h);
+  canvas.listeners.wheel({deltaY:-120,preventDefault(){}});
+  assert.equal(mapZoom(h),start+1);
+  for(let step=0;step<12;step++)canvas.listeners.wheel({deltaY:120,preventDefault(){}});
+  assert.equal(mapZoom(h),13,'zooming out stops at the minimum');
+  for(let step=0;step<12;step++)canvas.listeners.wheel({deltaY:-120,preventDefault(){}});
+  assert.equal(mapZoom(h),19,'zooming in stops at the maximum');
+});
+
+test('saved points can be listed, switched, renamed and deleted',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  const select=h.el('map-points');
+  assert.deepEqual(select.options.map(option=>option.value),['p1']);
+  assert.match(select.options[0].textContent,/^本机采样样本 · \d+ 米$/);
+  assert.equal(select.value,'p1');
+  assert.match(h.el('map-point-state').textContent,/当前生效：本机采样样本/);
+  assert.equal(h.el('map-point-name').value,'本机采样样本');
+
+  clickMap(h,360,200);
+  h.el('map-point-name').value='图书馆北门';
+  h.el('map-save').onclick();await settle();await settle();
+  const save=h.calls.find(call=>call.action==='simulation_point_save');
+  assert.equal(save.payload.name,'图书馆北门','the name travels with the pick');
+  assert.equal(h.el('map-points').options.length,2);
+  assert.match(h.el('map-point-state').textContent,/图书馆北门/);
+
+  h.el('map-points').value='p1';
+  h.el('map-points').listeners.change();await settle();await settle();
+  assert.ok(h.calls.some(call=>call.action==='simulation_point_select'&&call.payload.id==='p1'),
+            'choosing from the dropdown switches the active point');
+  assert.equal(h.el('map-points').value,'p1');
+  assert.equal(h.el('map-point-name').value,'本机采样样本','the box follows the switched point');
+
+  h.el('map-point-name').value='原始采样';
+  h.el('map-point-rename').onclick();await settle();await settle();
+  const rename=h.calls.find(call=>call.action==='simulation_point_rename');
+  assert.equal(rename.payload.id,'p1');
+  assert.equal(rename.payload.name,'原始采样');
+  assert.match(h.el('map-point-state').textContent,/原始采样/);
+
+  h.el('map-point-delete').onclick();
+  assert.match(h.el('confirm-title').textContent,/删除选点「原始采样」/);
+  h.el('confirm-ok').onclick();await settle();await settle();
+  assert.ok(h.calls.some(call=>call.action==='simulation_point_delete'&&call.payload.id==='p1'));
+  // Deleting the active point switches to the remaining one instead of losing the position.
+  assert.deepEqual(h.el('map-points').options.map(option=>option.value),['p2']);
+  assert.equal(h.el('map-points').value,'p2');
+  assert.match(h.el('map-point-state').textContent,/当前生效：图书馆北门/);
+});
+
+test('map markers carry the point name instead of a generic label',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  assert.equal(vm.runInContext('mapSavedLabel(mapState)',h.context),'本机采样样本');
+  clickMap(h,320,180);
+  assert.equal(vm.runInContext('mapPendingLabel(mapState)',h.context),'待保存：本机采样样本',
+               'a pick keeps the active name, so the marker says which point it would move');
+  h.el('map-point-name').value='杏园三舍';
+  assert.equal(vm.runInContext('mapPendingLabel(mapState)',h.context),'待保存：杏园三舍',
+               'the pending marker shows the name being typed');
+  h.el('map-save').onclick();await settle();await settle();
+  assert.equal(vm.runInContext('mapSavedLabel(mapState)',h.context),'杏园三舍');
+});
+
+test('the name box survives background redraws while it is being edited',async()=>{
+  // Tile loads redraw the map constantly; the box used to be rewritten from the active point on
+  // every redraw, which silently replaced whatever the user was typing.
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  h.el('map-point-name').value='宿舍东门';
+  vm.runInContext('renderMap()',h.context);      // what a tile arriving mid-typing does
+  vm.runInContext('renderMap()',h.context);
+  assert.equal(h.el('map-point-name').value,'宿舍东门','typing must not be wiped');
+  h.el('map-point-rename').onclick();await settle();await settle();
+  const rename=h.calls.find(call=>call.action==='simulation_point_rename');
+  assert.equal(rename.payload.name,'宿舍东门','the typed name is what gets renamed');
+  assert.match(h.el('map-point-state').textContent,/当前生效：宿舍东门/);
+  assert.equal(h.el('map-point-name').value,'宿舍东门');
+});
+
+test('a sample that is not a saved point is offered as itself',async()=>{
+  const h=harness('simulation');await settle();
+  h.map.points=[];h.map.active_id='';
+  await openMap(h);
+  assert.equal(h.el('map-points').options.length,1);
+  assert.match(h.el('map-points').options[0].textContent,/当前样本（未命名）/);
+  assert.match(h.el('map-point-state').textContent,/当前生效：未命名的样本/);
+  assert.equal(h.el('map-point-rename').disabled,true);
+  assert.equal(h.el('map-point-delete').disabled,true);
+});
+
+test('closing the map or leaving simulation mode hides the picker',async()=>{
+  const h=harness('simulation');await settle();
+  await openMap(h);
+  h.el('map-close').onclick();
+  assert.equal(h.el('map-dialog').open,false);
+  assert.equal(h.el('open-map-picker').hidden,false);
+  await openMap(h);
+  h.data.dorm.settings.location_source='windows';
+  await h.refresh();
+  assert.equal(h.el('map-dialog').open,false);
+  assert.equal(h.el('open-map-picker').hidden,true);
 });

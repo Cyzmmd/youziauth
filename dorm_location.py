@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 from pathlib import Path
 
@@ -37,6 +38,11 @@ MESSAGES = {
 
 
 ACCURACY_LIMIT_M = 200.0
+
+# A point chosen on the map is not a measurement, so it states a plausible Wi-Fi-range accuracy
+# instead of pretending to be a precise fix. The replay then drifts it like any other sample.
+PICK_SOURCE = 'MAP_PICK'
+PICK_ACCURACY_M = 100.0
 
 # School-facing label for every accepted position. A replayed sample must not be distinguishable
 # from a live Windows fix, so both sources report this same value inside mapData / qddz; the active
@@ -78,6 +84,59 @@ def wgs84_to_gcj02(lat, lng):
     a = a * 180 / ((6378245 * (1-.00669342162296594323))/(magic*root)*math.pi)
     b = b * 180 / (6378245/root*math.cos(rad)*math.pi)
     return lat+a, lng+b
+
+
+def gcj02_to_wgs84(lat, lng):
+    """Inverse of wgs84_to_gcj02, by bounded iteration (sub-metre after three passes).
+
+    The school publishes its check-in point in GCJ02 while the map picker works in WGS84, so
+    the reference has to be readable in the frame the user clicks in.
+    """
+    if not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271):
+        return lat, lng
+    guess_lat, guess_lng = lat, lng
+    for _ in range(3):
+        forward_lat, forward_lng = wgs84_to_gcj02(guess_lat, guess_lng)
+        guess_lat += lat - forward_lat
+        guess_lng += lng - forward_lng
+    return guess_lat, guess_lng
+
+
+def distance_metres(lat1, lng1, lat2, lng2):
+    """Great-circle distance on a spherical Earth. The school's own check stays authoritative."""
+    radius = 6371000.0
+    first, second = math.radians(lat1), math.radians(lat2)
+    delta_lat, delta_lng = second - first, math.radians(lng2 - lng1)
+    a = (math.sin(delta_lat / 2) ** 2
+         + math.cos(first) * math.cos(second) * math.sin(delta_lng / 2) ** 2)
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+def radius_metres(value):
+    """Read the school's radius text ('800米', '800') as metres; None when it is unusable."""
+    match = re.search(r'\d+(?:\.\d+)?', str(value or ''))
+    return float(match.group()) if match else None
+
+
+def map_pick_sample(latitude, longitude, *, accuracy=PICK_ACCURACY_M, timestamp=None):
+    """Turn a raw WGS84 map pick into a sample the replay path accepts.
+
+    A pick is stored exactly like a captured Windows fix, so the replay stays the only place that
+    converts to GCJ02 and drifts the point: the school receives the same shape of position either
+    way, and only the local sample records how the point was chosen.
+    """
+    try:
+        lat, lng, acc = float(latitude), float(longitude), float(accuracy)
+    except (TypeError, ValueError):
+        raise ValueError('选点坐标无效，请在地图上重新选择。') from None
+    if (not all(math.isfinite(value) for value in (lat, lng, acc))
+            or not -90 <= lat <= 90 or not -180 <= lng <= 180):
+        raise ValueError('选点坐标无效，请在地图上重新选择。')
+    if acc <= 0 or acc > ACCURACY_LIMIT_M:
+        raise ValueError('选点精度超出可提交范围，请重新选择。')
+    return {'latitude': lat, 'longitude': lng, 'accuracy': acc,
+            'timestamp': time.time() if timestamp is None else float(timestamp),
+            'source': PICK_SOURCE}
 
 
 def validate_position(data):
@@ -228,8 +287,12 @@ def locate(source='windows', sample_path=None):
         raise LocationFailure('sample_invalid') from None
 
 
-def probe_location(ui_dispatch=None, *, source='windows', sample_path=None):
-    """Local quality check only. Never return coordinates or call the school API."""
+def probe_location(ui_dispatch=None, *, source='windows', sample_path=None, label=''):
+    """Local quality check only. Never return coordinates or call the school API.
+
+    `label` names the simulation point being replayed, so the check says which saved position it
+    just used instead of leaving the user to guess which one is active.
+    """
     try:
         if source == 'windows' and ui_dispatch is not None:
             permission = request_permission(ui_dispatch)
@@ -237,7 +300,9 @@ def probe_location(ui_dispatch=None, *, source='windows', sample_path=None):
                 raise LocationFailure('denied' if permission == 'DENIED' else 'unspecified')
         position = locate(source, sample_path)
         accuracy = round(position['accuracy'], 1)
-        message = (f'模拟定位检测通过，采样精度约 {accuracy:g} 米。基于本机样本并随机偏移，并非当前位置；未提交打卡。'
+        named = f'当前使用选点「{label}」，' if source == 'simulation' and label else ''
+        message = (f'模拟定位检测通过：{named}采样精度约 {accuracy:g} 米。'
+                   '基于已保存位置并随机偏移，并非当前位置；未提交打卡。'
                    if source == 'simulation' else
                    f'定位检测通过，精度约 {accuracy:g} 米。未提交打卡；正式提交时会重新获取位置。')
         return {'state':'ready', 'message':message,

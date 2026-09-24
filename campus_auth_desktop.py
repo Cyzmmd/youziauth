@@ -171,6 +171,9 @@ def preview_server(port):
             if self.path == '/api/state':
                 with lock:
                     return self._json(bridge.snapshot())
+            if self.path == '/api/simulation-map':
+                with lock:
+                    return self._json(bridge.simulation_map())
             return super().do_GET()
 
         def do_POST(self):

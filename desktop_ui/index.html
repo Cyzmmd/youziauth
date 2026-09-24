@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <!-- The map picker is the only feature that loads a third-party resource: the OpenStreetMap
+       basemap tiles, named explicitly below. Everything else stays same-origin. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
   <title>youziauth · 校园日常</title>
   <link rel="stylesheet" href="icons/icons.css">
   <link rel="stylesheet" href="style.css">
@@ -61,20 +63,52 @@
             <article class="paper-card compact location-source-card">
             <h3><i class="bi bi-geo-alt" aria-hidden="true"></i> 定位来源与登录</h3>
             <label for="location-source">选择定位来源</label>
-            <select id="location-source" name="location_source" aria-describedby="location-source-scope" required>
+            <select id="location-source" name="location_source" required>
               <option value="windows">真实定位（Windows / Wi-Fi）</option>
               <option value="simulation">模拟定位（已保存样本）</option>
             </select>
-            <p class="field-hint" id="location-source-scope">保存后立即全局生效：定位检测、手动提交和自动打卡。重启后保留已保存的选择。</p>
             <button class="primary full" id="save-location-source" type="button">保存定位来源</button>
-            <span class="badge full" id="location-source-badge" aria-live="polite">当前来源 · 真实定位（Windows）</span>
             <div class="location-check" aria-live="polite"><p id="location-message">点击下方按钮请求系统授权并检测实时定位，不会提交打卡。</p><small id="location-checked">仅检测定位，不会提交打卡</small></div>
             <button class="primary full" id="authorize-location" data-action="location_authorize">授权并检测定位</button>
             <p class="field-hint" id="location-mode-hint" hidden>实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
+            <button class="secondary full" id="open-map-picker" type="button" hidden>在地图上选择位置</button>
             <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button>
           </article></aside>
         </div>
       </section>
+
+      <dialog id="map-dialog" class="map-dialog" aria-labelledby="map-title">
+        <article class="paper-card compact map-card" id="map-card">
+          <h3 id="map-title"><i class="bi bi-map" aria-hidden="true"></i> 地图选点</h3>
+          <p class="field-hint" id="map-summary">在地图上点击，选择模拟定位要使用的位置。</p>
+          <div class="map-points">
+            <label for="map-points">已保存的选点</label>
+            <select id="map-points" aria-describedby="map-point-state"></select>
+            <p class="field-hint" id="map-point-state">选择后立即生效，写入模拟定位样本。</p>
+          </div>
+          <div class="map-point-edit">
+            <label for="map-point-name">名称</label>
+            <input id="map-point-name" type="text" maxlength="24" placeholder="留空自动命名" autocomplete="off">
+            <button type="button" class="secondary" id="map-point-rename">重命名</button>
+            <button type="button" class="secondary" id="map-point-delete">删除</button>
+            <p class="field-hint" id="map-name-hint">名称与已有选点相同则更新它的位置，换个名称就是新建；切换选点不会删除任何一个点。</p>
+          </div>
+          <div class="map-frame">
+            <canvas id="map-canvas" width="720" height="400" tabindex="0" role="application" aria-label="地图选点：拖动平移，点击选择位置，滚轮或加减按钮缩放"></canvas>
+            <span class="badge" id="map-distance-badge">未选择位置</span>
+          </div>
+          <div class="map-controls">
+            <button type="button" class="secondary" id="map-zoom-in" aria-label="放大地图">放大</button>
+            <button type="button" class="secondary" id="map-zoom-out" aria-label="缩小地图">缩小</button>
+            <button type="button" class="secondary" id="map-recenter">回到学校位置</button>
+            <label class="map-toggle" for="map-tiles"><input type="checkbox" id="map-tiles" checked> 在线底图</label>
+          </div>
+          <div class="form-footer">
+            <button type="button" class="primary" id="map-save" disabled>保存为选点</button>
+          </div>
+          <button type="button" class="text-button" id="map-close">关闭地图</button>
+        </article>
+      </dialog>
 
       <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre></article><p class="field-hint">向他人分享记录前，请检查并隐藏账号、IP 等个人信息。</p></section>
       <section class="page" id="updates" aria-labelledby="updates-title" hidden>

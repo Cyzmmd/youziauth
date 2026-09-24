@@ -6,6 +6,9 @@ const dirty = {network:false, dorm:false};
 const revisions = {network:0, dorm:0};
 let sourceDirty = false, sourceRevision = 0;
 let api;
+let mapState = null;
+let mapDrag = null, mapSuppressPick = false, mapNameFor = null;
+const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
 
 function notify(message, error=false) {
   clearTimeout(timer);
@@ -31,9 +34,6 @@ navigate();
 $('date-label').textContent = new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 
 function badge(id, text, tone='') {$(id).textContent=text;$(id).className='badge'+(tone ? ' '+tone : '');}
-function sourceBadge(text,tone='') {
-  document.querySelectorAll('#location-source-badge').forEach(node=>{node.textContent=text;node.className='badge full'+(tone ? ' '+tone : '');});
-}
 function sourceSummary(simulation) {return simulation?'模拟定位（已保存样本）':'真实定位（Windows / Wi-Fi）';}
 function markDirty(kind, value) {
   dirty[kind] = value;
@@ -55,10 +55,6 @@ function render() {
   const n=state.network,d=state.dorm,simulation=savedLocationSource()==='simulation';
   $('preview-tag').hidden = !state.preview;
   $('preview-tag').textContent = state.location_diagnostic ? '真实定位诊断 · 其他功能为演示' : '演示预览';
-  sourceBadge(simulation?'当前来源 · 模拟定位（非实时）':'当前来源 · 真实定位（Windows）',simulation?'warning':'');
-  $('location-source-scope').textContent=simulation
-    ? '保存后立即全局生效；模拟定位使用本机已保存样本，并非当前位置。重启后保留已保存的选择。'
-    : '保存后立即全局生效：定位检测、手动提交和自动打卡。重启后保留已保存的选择。';
   $('overview-location-source').textContent=sourceSummary(simulation);
   // Only the real-location mode needs instructions; the simulation wording is dropped.
   $('location-mode-hint').hidden=simulation;
@@ -108,6 +104,8 @@ function render() {
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
   $('cancel-dorm').disabled=pending||!d.busy;
   $('logout-dorm').disabled=pending||d.busy;
+  if(!simulation&&mapState)closeMap();
+  $('open-map-picker').hidden=!simulation||!!mapState;
   document.querySelectorAll('button[type="submit"]').forEach(b=>b.disabled=pending||(b.closest('form').id==='dorm-form'&&d.busy));
   renderUpdates();
   renderLogs();
@@ -254,12 +252,355 @@ $('quit').onclick=()=>confirmAction('退出 youziauth？','退出将停止本程
 $('refresh-records').onclick=async()=>{await refresh();if($('connection-error').hidden)notify('运行记录已刷新');};
 document.querySelectorAll('[data-log]').forEach(button=>button.onclick=()=>{logType=button.dataset.log;document.querySelectorAll('[data-log]').forEach(b=>{b.classList.toggle('selected',b===button);b.setAttribute('aria-pressed',String(b===button));});renderLogs();});
 
+/* Simulation map picker ---------------------------------------------------------------------
+   The one place this UI renders coordinates: the point the user chooses to submit, and the
+   school's own published check-in point. A live Windows fix is never drawn here, and the whole
+   card stays closed until the saved source is 模拟定位 and the user opens it. */
+function mapScale(zoom){return MAP_TILE*Math.pow(2,zoom);}
+function mapX(lng,zoom){return (lng+180)/360*mapScale(zoom);}
+function mapY(lat,zoom){const s=Math.sin(lat*Math.PI/180);return (0.5-Math.log((1+s)/(1-s))/(4*Math.PI))*mapScale(zoom);}
+function mapLng(x,zoom){return x/mapScale(zoom)*360-180;}
+function mapLat(y,zoom){const n=Math.PI-2*Math.PI*y/mapScale(zoom);return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n)));}
+function mapMetresPerPixel(lat,zoom){return 156543.03392*Math.cos(lat*Math.PI/180)/Math.pow(2,zoom);}
+function mapDistance(from,to){
+  const radius=6371000,first=from.latitude*Math.PI/180,second=to.latitude*Math.PI/180;
+  const dLat=second-first,dLng=(to.longitude-from.longitude)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(first)*Math.cos(second)*Math.sin(dLng/2)**2;
+  return 2*radius*Math.asin(Math.min(1,Math.sqrt(a)));
+}
+function mapSize(canvas){return {width:canvas.width||640,height:canvas.height||360};}
+function mapEventPoint(event){
+  // Canvas coordinates, not CSS pixels: the canvas is stretched to the dialog width.
+  const canvas=$('map-canvas');
+  let x=event.offsetX,y=event.offsetY;
+  if(typeof x!=='number'||typeof y!=='number')return null;
+  const rect=canvas.getBoundingClientRect?canvas.getBoundingClientRect():null;
+  if(rect&&rect.width&&canvas.width){x=x*canvas.width/rect.width;y=y*canvas.height/rect.height;}
+  return {x,y};
+}
+function zoomMap(step){
+  if(!mapState)return;
+  mapState.zoom=Math.max(MAP_MIN_ZOOM,Math.min(MAP_MAX_ZOOM,mapState.zoom+step));
+  mapState.tiles={};                       // a new zoom needs new tiles
+  renderMap();
+}
+function panMap(dx,dy){
+  // Dragging right moves the map right, so the centre travels the other way.
+  const zoom=mapState.zoom;
+  mapState.center={latitude:mapLat(mapY(mapState.center.latitude,zoom)-dy,zoom),
+                   longitude:mapLng(mapX(mapState.center.longitude,zoom)-dx,zoom)};
+  renderMap();
+}
+function mapScreen(state,lat,lng,size){
+  return {x:mapX(lng,state.zoom)-mapX(state.center.longitude,state.zoom)+size.width/2,
+          y:mapY(lat,state.zoom)-mapY(state.center.latitude,state.zoom)+size.height/2};
+}
+function mapPointAt(state,size,x,y){
+  return {latitude:mapLat(mapY(state.center.latitude,state.zoom)+(y-size.height/2),state.zoom),
+          longitude:mapLng(mapX(state.center.longitude,state.zoom)+(x-size.width/2),state.zoom)};
+}
+function mapBounds(state,size){
+  const topLeft=mapPointAt(state,size,0,0),bottomRight=mapPointAt(state,size,size.width,size.height);
+  return {north:topLeft.latitude,west:topLeft.longitude,south:bottomRight.latitude,east:bottomRight.longitude};
+}
+function mapRange(state,point){
+  if(!point||!state.reference)return null;
+  const metres=mapDistance(point,state.reference),limit=state.reference.radius_m;
+  return {metres,inRange:limit?metres<=limit:null};
+}
+function mapRound(value){return Math.round(value*1e6)/1e6;}
+function mapBadge(state){
+  const target=state.picked||state.point;
+  if(!target)return '未选择位置';
+  const prefix=state.picked?'待保存 · ':'已保存 · ';
+  const range=mapRange(state,target);
+  if(!range)return prefix+'距基准点未知';
+  const within=range.inRange===false?'（超出范围）':range.inRange===true?'（范围内）':'';
+  return prefix+'距基准点 '+Math.round(range.metres)+' 米'+within;
+}
+function drawMapGrid(ctx,state,size){
+  const bounds=mapBounds(state,size),step=0.002;   // ~220 m of latitude
+  ctx.save();ctx.strokeStyle='rgba(93,113,133,.22)';ctx.lineWidth=1;
+  for(let lat=Math.ceil(bounds.south/step)*step;lat<=bounds.north;lat+=step){
+    const point=mapScreen(state,lat,bounds.west,size);
+    ctx.beginPath();ctx.moveTo(0,point.y);ctx.lineTo(size.width,point.y);ctx.stroke();
+  }
+  for(let lng=Math.ceil(bounds.west/step)*step;lng<=bounds.east;lng+=step){
+    const point=mapScreen(state,bounds.north,lng,size);
+    ctx.beginPath();ctx.moveTo(point.x,0);ctx.lineTo(point.x,size.height);ctx.stroke();
+  }
+  ctx.restore();
+  const width=100/mapMetresPerPixel(state.center.latitude,state.zoom);
+  if(width>=24&&width<=size.width/3){
+    ctx.save();ctx.strokeStyle='#4a5b6b';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(12,size.height-14);ctx.lineTo(12+width,size.height-14);ctx.stroke();
+    ctx.fillStyle='#4a5b6b';ctx.font='11px system-ui';ctx.fillText('100 米',12,size.height-20);ctx.restore();
+  }
+}
+function drawMapTiles(ctx,state,size){
+  if(!state.useTiles||!state.tiles)return;
+  const centreX=mapX(state.center.longitude,state.zoom),centreY=mapY(state.center.latitude,state.zoom);
+  for(const [key,tile] of Object.entries(state.tiles)){
+    const [zoom,x,y]=key.split('/').map(Number);
+    if(zoom!==state.zoom||!tile.ready)continue;
+    ctx.drawImage(tile.image,x*MAP_TILE-(centreX-size.width/2),y*MAP_TILE-(centreY-size.height/2),MAP_TILE,MAP_TILE);
+  }
+}
+function loadMapTiles(state,size){
+  if(!state.useTiles||!state.tile_url||typeof Image!=='function')return;
+  const zoom=Math.max(MAP_MIN_ZOOM,Math.min(MAP_MAX_ZOOM,state.zoom));
+  state.tiles=state.tiles||{};
+  const centreX=mapX(state.center.longitude,zoom),centreY=mapY(state.center.latitude,zoom);
+  const span=Math.pow(2,zoom);
+  const first={x:Math.floor((centreX-size.width/2)/MAP_TILE),y:Math.floor((centreY-size.height/2)/MAP_TILE)};
+  const last={x:Math.floor((centreX+size.width/2)/MAP_TILE),y:Math.floor((centreY+size.height/2)/MAP_TILE)};
+  for(let x=first.x;x<=last.x;x++)for(let y=first.y;y<=last.y;y++){
+    if(y<0||y>=span)continue;
+    const column=((x%span)+span)%span,key=zoom+'/'+column+'/'+y;
+    if(state.tiles[key])continue;
+    const image=new Image();
+    state.tiles[key]={image,ready:false};
+    image.onload=()=>{state.tiles[key].ready=true;if(mapState===state)renderMap();};
+    image.onerror=()=>{state.tiles[key].failed=true;};
+    image.src=state.tile_url.replace('{z}',zoom).replace('{x}',column).replace('{y}',y);
+  }
+}
+function drawMapMarker(ctx,point,colour,label){
+  ctx.save();ctx.beginPath();ctx.arc(point.x,point.y,7,0,Math.PI*2);
+  ctx.fillStyle=colour;ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle=colour;ctx.font='12px system-ui';ctx.fillText(label,point.x+11,point.y+4);ctx.restore();
+}
+function mapPendingLabel(state){
+  // While the user is typing a name, the pending marker carries it: the label they see on the map
+  // is the one that will be saved.
+  const typed=($('map-point-name').value||'').trim();
+  return typed?`待保存：${typed}`:'待保存';
+}
+function mapSavedLabel(state){
+  const active=(state.points||[]).find(point=>point.active);
+  if(active)return active.name;
+  return state.point&&state.point.picked?'已保存（地图选点）':'已保存（本机样本）';
+}
+function mapCredit(state){
+  // The map data needs its credit; the licence asks for it, so it is drawn on the canvas instead
+  // of taking a paragraph of its own. Off with the basemap, because then no map data is shown.
+  return state.useTiles?(state.attribution||'© OpenStreetMap contributors'):'';
+}
+function drawMap(ctx,canvas,state){
+  const size=mapSize(canvas);
+  ctx.clearRect(0,0,size.width,size.height);
+  ctx.fillStyle='#eef1f4';ctx.fillRect(0,0,size.width,size.height);
+  drawMapGrid(ctx,state,size);
+  loadMapTiles(state,size);
+  drawMapTiles(ctx,state,size);
+  if(state.reference){
+    const point=mapScreen(state,state.reference.latitude,state.reference.longitude,size);
+    if(state.reference.radius_m){
+      const radius=state.reference.radius_m/mapMetresPerPixel(state.reference.latitude,state.zoom);
+      ctx.save();ctx.beginPath();ctx.arc(point.x,point.y,radius,0,Math.PI*2);
+      ctx.fillStyle='rgba(52,120,196,.10)';ctx.fill();
+      ctx.strokeStyle='rgba(52,120,196,.55)';ctx.setLineDash([6,4]);ctx.stroke();ctx.restore();
+    }
+    drawMapMarker(ctx,point,'#2f6fb2','学校打卡点');
+  }
+  if(state.point){
+    drawMapMarker(ctx,mapScreen(state,state.point.latitude,state.point.longitude,size),'#c2703a',
+                  mapSavedLabel(state));
+  }
+  if(state.picked)drawMapMarker(ctx,mapScreen(state,state.picked.latitude,state.picked.longitude,size),'#c0392b',
+                                mapPendingLabel(state));
+  const credit=mapCredit(state);
+  if(credit){
+    ctx.save();ctx.font='10px system-ui';ctx.textAlign='right';
+    ctx.fillStyle='rgba(41,51,62,.6)';
+    ctx.fillText(credit,size.width-8,size.height-6);
+    ctx.restore();
+  }
+}
+function mapPointLabel(point){
+  const range=mapRange(mapState,point);
+  return range?`${point.name} · ${Math.round(range.metres)} 米`:point.name;
+}
+function renderPoints(){
+  const select=$('map-points');
+  if(!select||!mapState)return;
+  const points=mapState.points||[];
+  const options=points.map(point=>{
+    const option=document.createElement('option');
+    option.value=point.id;
+    option.textContent=mapPointLabel(point);
+    return option;
+  });
+  if(mapState.point&&!points.some(point=>point.active)){
+    // The replayed sample is not one of the saved points: a captured sample, or a deleted point.
+    const option=document.createElement('option');
+    option.value='';
+    option.textContent='当前样本（未命名）';
+    options.unshift(option);
+  }
+  select.replaceChildren(...options);
+  select.value=mapState.active_id||'';
+  select.disabled=!options.length;
+  const active=points.find(point=>point.active);
+  $('map-point-state').textContent=active
+    ? `当前生效：${active.name}${active.saved_at?'（'+active.saved_at.slice(0,16).replace('T',' ')+'）':''}`
+    : (mapState.point?'当前生效：未命名的样本。':'尚未保存任何选点：在地图上点击后保存。');
+  // The name box follows the active point, but only when it actually changes: it used to be
+  // rewritten on every redraw, and tile loads redraw constantly, so typing was being wiped.
+  const activeId=active?active.id:'';
+  if(mapNameFor!==activeId){
+    mapNameFor=activeId;
+    $('map-point-name').value=active?active.name:'';
+  }
+  $('map-point-rename').disabled=!active;
+  $('map-point-delete').disabled=!active;
+}
+function renderMap(){
+  const canvas=$('map-canvas');
+  if(!canvas||!mapState)return;
+  mapState.useTiles=$('map-tiles').checked;
+  $('map-distance-badge').textContent=mapBadge(mapState);
+  $('map-summary').textContent=mapState.reference
+    ? '学校打卡点：'+(mapState.reference.address||'以学校任务为准')+'，允许半径约 '+
+      (mapState.reference.radius_m?Math.round(mapState.reference.radius_m)+' 米':'未知')+'。点击地图放置标记。'
+    : '尚未查询今日任务，地图上没有学校基准点；仍可先选点并保存，查询任务后即可核对距离。';
+  $('map-save').disabled=!mapState.picked;
+  renderPoints();
+  const ctx=canvas.getContext?canvas.getContext('2d'):null;
+  if(ctx)drawMap(ctx,canvas,mapState);
+}
+function applyMapModel(model){
+  const centre=model.reference||model.point||mapState?.center||{latitude:0,longitude:0};
+  mapState={...model,center:{latitude:centre.latitude,longitude:centre.longitude},
+            zoom:mapState?.zoom||17,picked:null,tiles:mapState?.tiles||{}};
+  const dialog=$('map-dialog');
+  if(dialog&&!dialog.open)dialog.showModal();
+  renderMap();render();
+}
+function clearMapState(){
+  mapState=null;
+  $('map-save').disabled=true;
+  $('map-distance-badge').textContent='未选择位置';
+}
+function closeMap(){
+  clearMapState();
+  const dialog=$('map-dialog');
+  if(dialog&&dialog.open)dialog.close();
+}
+async function loadMapModel(){
+  if(!api||!api.simulation_map)throw new Error('地图选点需要桌面程序支持，请更新后再试。');
+  const model=await api.simulation_map();
+  if(!model||model.ok===false)throw new Error(model?.message||'地图数据读取失败，请稍后重试。');
+  return model;
+}
+async function openMap(){
+  if(!state||syncedEpoch!==epoch){notify('定位设置尚未同步，请稍后重试。',true);return;}
+  if(savedLocationSource()!=='simulation'){notify('请先把定位来源保存为模拟定位，再使用地图选点。',true);return;}
+  try{applyMapModel(await loadMapModel());}
+  catch(error){notify(error.message,true);}
+}
+async function reloadMap(){
+  try{applyMapModel(await loadMapModel());}catch{closeMap();render();}
+}
+$('open-map-picker').onclick=openMap;
+$('map-close').onclick=()=>{closeMap();render();};
+$('map-dialog').addEventListener('close',()=>{clearMapState();render();});
+$('map-zoom-in').onclick=()=>zoomMap(1);
+$('map-zoom-out').onclick=()=>zoomMap(-1);
+$('map-recenter').onclick=()=>{
+  if(!mapState)return;
+  const target=mapState.reference||mapState.point;
+  if(target)mapState.center={latitude:target.latitude,longitude:target.longitude};
+  renderMap();
+};
+$('map-tiles').addEventListener('change',()=>{if(mapState){mapState.tiles={};renderMap();}});
+$('map-canvas').addEventListener('wheel',event=>{
+  if(!mapState)return;
+  event.preventDefault();
+  zoomMap(event.deltaY<0?1:-1);
+});
+$('map-canvas').addEventListener('pointerdown',event=>{
+  if(!mapState)return;
+  const point=mapEventPoint(event);
+  if(!point)return;
+  mapDrag={x:point.x,y:point.y};
+  mapSuppressPick=false;
+  const canvas=$('map-canvas');
+  canvas.setPointerCapture?.(event.pointerId);
+  canvas.classList.toggle('dragging',true);
+});
+$('map-canvas').addEventListener('pointermove',event=>{
+  if(!mapState||!mapDrag)return;
+  const point=mapEventPoint(event);
+  if(!point)return;
+  const dx=point.x-mapDrag.x,dy=point.y-mapDrag.y;
+  if(Math.abs(dx)<2&&Math.abs(dy)<2)return;   // a twitchy hand is still a click
+  mapSuppressPick=true;
+  mapDrag={x:point.x,y:point.y};
+  panMap(dx,dy);
+});
+for(const ending of ['pointerup','pointercancel']){
+  $('map-canvas').addEventListener(ending,()=>{
+    mapDrag=null;
+    $('map-canvas').classList.toggle('dragging',false);
+  });
+}
+$('map-points').addEventListener('change',async()=>{
+  const id=$('map-points').value;
+  if(!mapState||!id||id===mapState.active_id)return;
+  if(await act('simulation_point_select',{id}))await reloadMap();
+});
+$('map-point-name').addEventListener('input',()=>{if(mapState)renderMap();});
+$('map-point-rename').onclick=async()=>{
+  const active=(mapState?.points||[]).find(entry=>entry.active);
+  if(!active)return;
+  const name=$('map-point-name').value;
+  if(await act('simulation_point_rename',{id:active.id,name})){
+    mapNameFor=null;                    // refresh the box from the stored (cleaned) name
+    await reloadMap();
+  }
+};
+$('map-point-delete').onclick=()=>{
+  const active=(mapState?.points||[]).find(entry=>entry.active);
+  if(!active)return;
+  confirmAction(`删除选点「${active.name}」？`,'删除只影响这一个选点；如果它是当前生效的点，会自动切换到列表里的下一个。',async()=>{
+    if(await act('simulation_point_delete',{id:active.id}))await reloadMap();
+  });
+};
+$('map-canvas').addEventListener('click',event=>{
+  if(!mapState)return;
+  if(mapSuppressPick){mapSuppressPick=false;return;}   // the click that ended a drag is not a pick
+  const point=mapEventPoint(event);
+  if(!point)return;
+  const target=mapPointAt(mapState,mapSize($('map-canvas')),point.x,point.y);
+  mapState.picked={latitude:mapRound(target.latitude),longitude:mapRound(target.longitude)};
+  renderMap();
+});
+$('map-canvas').addEventListener('keydown',event=>{
+  if(!mapState)return;
+  if(event.key==='+'||event.key==='='){zoomMap(1);event.preventDefault();return;}
+  if(event.key==='-'||event.key==='_'){zoomMap(-1);event.preventDefault();return;}
+  const metres=event.shiftKey?200:50;
+  const moves={ArrowLeft:[-metres,0],ArrowRight:[metres,0],ArrowUp:[0,metres],ArrowDown:[0,-metres]};
+  const move=moves[event.key];
+  if(!move)return;
+  event.preventDefault();
+  mapState.center={latitude:mapState.center.latitude+move[1]/111320,
+                   longitude:mapState.center.longitude+move[0]/(111320*Math.cos(mapState.center.latitude*Math.PI/180))};
+  renderMap();
+});
+$('map-save').onclick=async()=>{
+  if(!mapState||!mapState.picked)return;
+  const {latitude,longitude}=mapState.picked;
+  if(await act('simulation_point_save',{latitude,longitude,name:$('map-point-name').value}))await reloadMap();
+};
+
 function connect(){if(api||!window.pywebview?.api)return;api=window.pywebview.api;refresh();}
 window.addEventListener('pywebviewready',connect);
 connect();
 // Only the isolated preview server sets this query. Native production uses the bridge only.
 if(new URLSearchParams(location.search).get('preview')==='1'){
-  api={snapshot:async()=>{const r=await fetch('/api/state');if(!r.ok)throw Error();return r.json();},dispatch:async(action,payload)=>{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload})});if(!r.ok)throw Error();return r.json();}};
+  api={snapshot:async()=>{const r=await fetch('/api/state');if(!r.ok)throw Error();return r.json();},dispatch:async(action,payload)=>{const r=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload})});if(!r.ok)throw Error();return r.json();},simulation_map:async()=>{const r=await fetch('/api/simulation-map');if(!r.ok)throw Error();return r.json();}};
   refresh();
 }
 setInterval(refresh,1500);

@@ -13,6 +13,8 @@ from pathlib import Path
 
 from windows_credentials import CredentialStore, DpapiProtector, atomic_write_bytes
 
+import dorm_points
+
 SHANGHAI = dt.timezone(dt.timedelta(hours=8))
 LOGIN_RECORD_PREFIX = 'youziauth-session-v1\n'
 
@@ -75,6 +77,10 @@ class Task:
     address: str
     radius: str
     dorm_form: str = ''
+    # The school's own check-in point, in the GCJ02 frame its forms use. Published task data,
+    # like the address: the map picker centres on it and draws the acceptance radius.
+    latitude: str = ''
+    longitude: str = ''
 
     @property
     def key(self):
@@ -229,6 +235,40 @@ class Store:
             return (self.root / 'history.log').read_text(encoding='utf-8')
         except FileNotFoundError:
             return ''
+
+    def sample(self):
+        """The stored simulation point, or None when it is absent or unreadable."""
+        try:
+            value = self._read('location-sample.json', None)
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def save_sample(self, sample):
+        """Point the replay at one sample.
+
+        Nothing is backed up: every candidate position lives in the point list, so switching,
+        re-picking or renaming never destroys the previous one.
+        """
+        self._write('location-sample.json', sample)
+
+    def clear_sample(self):
+        (self.root / 'location-sample.json').unlink(missing_ok=True)
+
+    def drop_legacy_backup(self):
+        """1.5.2 kept a one-level undo file; the point list replaced it."""
+        (self.root / 'location-sample.previous.json').unlink(missing_ok=True)
+
+    def points(self):
+        """Named simulation points; an unreadable list degrades to empty, never fatal."""
+        try:
+            value = self._read('location-points.json', None)
+        except (OSError, ValueError):
+            return dorm_points.empty()
+        return dorm_points.normalize(value)
+
+    def save_points(self, state):
+        self._write('location-points.json', dorm_points.normalize(state))
 
 
 class Engine:
