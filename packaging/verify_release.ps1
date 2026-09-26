@@ -4,18 +4,31 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputDirectory
 )
 
+# Verifies that the MSI really contains the two application executables at the
+# expected version, and that the detached Ed25519 authenticators match its bytes.
+# The signature check is the release gate; tools/sign_release.py refuses to sign
+# with a key that does not match the public key compiled into the client.
+
 $ErrorActionPreference = "Stop"
 
+$Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $MsiPath = (Resolve-Path -LiteralPath $MsiPath).Path
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 
-$msiSignature = Get-AuthenticodeSignature -LiteralPath $MsiPath
-if ($msiSignature.Status -ne 'Valid') {
-    throw "MSI signature is $($msiSignature.Status)"
+# The published signature must genuinely cover these installer bytes. The check
+# uses the public key compiled into the client, so it needs no private key.
+$SignaturePath = Join-Path $OutputDirectory 'youziauth.msi.ed25519'
+if (-not (Test-Path -LiteralPath $SignaturePath)) {
+    $SignaturePath = Join-Path (Split-Path -Parent $MsiPath) 'youziauth.msi.ed25519'
 }
-if ($null -eq $msiSignature.TimeStamperCertificate) {
-    throw "MSI signature has no trusted timestamp"
+if (-not (Test-Path -LiteralPath $SignaturePath)) {
+    throw "Missing Ed25519 signature for $MsiPath"
+}
+& python (Join-Path $Root 'tools/sign_release.py') --msi $MsiPath --version $Version `
+    --verify-signature-file $SignaturePath
+if ($LASTEXITCODE -ne 0) {
+    throw "Published Ed25519 signature does not cover the installer bytes"
 }
 
 $TempRoot = $env:RUNNER_TEMP
@@ -47,36 +60,26 @@ try {
             Where-Object Name -in @('youziauth.exe', 'youziauth-agent.exe')
     )
     if ($Executables.Count -ne 2) {
-        throw "Expected two signed application executables"
+        throw "Expected two application executables in the package"
     }
     foreach ($File in $Executables) {
-        $Signature = Get-AuthenticodeSignature -LiteralPath $File.FullName
-        if ($Signature.Status -ne 'Valid') {
-            throw "$($File.Name) signature is $($Signature.Status)"
-        }
-        if ($null -eq $Signature.TimeStamperCertificate) {
-            throw "$($File.Name) signature has no trusted timestamp"
-        }
         if ($File.VersionInfo.FileVersion -notin @($Version, "$Version.0")) {
             throw "$($File.Name) FileVersion mismatch"
         }
         if ($File.VersionInfo.ProductVersion -notin @($Version, "$Version.0")) {
             throw "$($File.Name) ProductVersion mismatch"
         }
+        if ($File.VersionInfo.CompanyName -ne 'yoouzic') {
+            throw "$($File.Name) CompanyName mismatch"
+        }
+        if ($File.VersionInfo.ProductName -ne 'youziauth') {
+            throw "$($File.Name) ProductName mismatch"
+        }
     }
 
-    $Hash = Get-FileHash -Algorithm SHA256 -LiteralPath $MsiPath
-    "$($Hash.Hash)  youziauth.msi" |
-        Set-Content -LiteralPath (Join-Path $OutputDirectory "SHA256SUMS.txt") -Encoding ascii
-    [ordered]@{
-        version = $Version
-        git_commit = $env:GITHUB_SHA
-        git_tag = $env:GITHUB_REF_NAME
-        msi_sha256 = $Hash.Hash
-        signer_subject = $msiSignature.SignerCertificate.Subject
-        timestamp_subject = $msiSignature.TimeStamperCertificate.Subject
-    } | ConvertTo-Json |
-        Set-Content -LiteralPath (Join-Path $OutputDirectory "release-provenance.json") -Encoding utf8
+    $Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $MsiPath).Hash.ToLowerInvariant()
+    "$Hash  youziauth.msi" | Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Encoding ascii
+    Write-Host "Verified youziauth.msi $Version ($Hash)"
 }
 finally {
     if (Test-Path -LiteralPath $Extract) {

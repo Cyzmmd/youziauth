@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = 'https://github.com/Cyzmmd/youziauth/releases/download/v1.5.0/'
 PACKAGE = b'fictional MSI bytes for offline tests'
 DIGEST = hashlib.sha256(PACKAGE).hexdigest()
+# Any 64-byte hex string: app_update only transports the signature, the Ed25519
+# check itself is exercised in tests/test_windows_update.py.
+SIGNATURE = 'ab' * 64
 
 
 def release(version='1.5.0'):
@@ -22,7 +25,10 @@ def release(version='1.5.0'):
             'assets': [{'name': 'youziauth.msi', 'browser_download_url': base + 'youziauth.msi',
                         'size': len(PACKAGE), 'state': 'uploaded'},
                        {'name': 'SHA256SUMS.txt', 'browser_download_url': base + 'SHA256SUMS.txt',
-                        'size': 80, 'state': 'uploaded'}]}
+                        'size': 80, 'state': 'uploaded'},
+                       {'name': 'youziauth.msi.ed25519',
+                        'browser_download_url': base + 'youziauth.msi.ed25519',
+                        'size': 129, 'state': 'uploaded'}]}
 
 
 class Response(io.BytesIO):
@@ -49,6 +55,8 @@ class UpdaterTests(unittest.TestCase):
             return Response(json.dumps(self.data).encode())
         if url == BASE + 'SHA256SUMS.txt':
             return Response((DIGEST.upper() + '  youziauth.msi\n').encode())
+        if url == BASE + 'youziauth.msi.ed25519':
+            return Response((SIGNATURE.upper() + '\n').encode())
         if url == BASE + 'youziauth.msi':
             return Response(PACKAGE)
         raise AssertionError('Unexpected URL: ' + url)
@@ -61,15 +69,17 @@ class UpdaterTests(unittest.TestCase):
 
     def test_new_release_downloads_and_becomes_ready_only_after_verification(self):
         observations = []
-        def verify(path, executable, version, digest):
-            observations.append((path.read_bytes(), version, digest, self.controller.snapshot()['state']))
+        def verify(path, executable, version, digest, signature):
+            observations.append((path.read_bytes(), version, digest, signature,
+                                 self.controller.snapshot()['state']))
         with patch('app_update.open_url', side_effect=self.open), patch('app_update.verify_msi', side_effect=verify):
             state = self.check()
         self.assertEqual(state['state'], 'ready')
         self.assertEqual(state['latest_version'], '1.5.0')
         self.assertEqual(state['progress'], 100)
         self.assertFalse(state['busy'])
-        self.assertEqual(observations, [(PACKAGE, '1.5.0', DIGEST, 'verifying')])
+        self.assertEqual(observations,
+                         [(PACKAGE, '1.5.0', DIGEST, SIGNATURE, 'verifying')])
         self.assertEqual(list(Path(self.tmp.name).glob('*.msi'))[0].read_bytes(), PACKAGE)
         self.assertNotIn('path', state)
 
@@ -247,14 +257,14 @@ class UpdaterTests(unittest.TestCase):
             with self.subTest(confirmed=confirmed, version=version), self.assertRaises(RuntimeError):
                 self.controller.install(confirmed, version)
         launched = []
-        def install(path, executable, version, digest, on_launch):
-            launched.append((path.read_bytes(), version, digest))
+        def install(path, executable, version, digest, on_launch, signature):
+            launched.append((path.read_bytes(), version, digest, signature))
             on_launch()
             return 0
         with patch('app_update.install_msi', side_effect=install):
             self.controller.install(True, '1.5.0')
             self.controller._worker.join(3)
-        self.assertEqual(launched, [(PACKAGE, '1.5.0', DIGEST)])
+        self.assertEqual(launched, [(PACKAGE, '1.5.0', DIGEST, SIGNATURE)])
         self.assertEqual(self.controller.snapshot()['state'], 'launched')
 
     def test_installer_cancel_allows_retry_but_verification_failure_does_not(self):

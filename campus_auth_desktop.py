@@ -206,6 +206,16 @@ def preview_server(port):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if '--verify-update' in argv:
+        # Update verifier. This must dispatch before any GUI setup: a windowed
+        # build has no console, the caller reads only the exit code, and a
+        # malformed invocation must fail fast instead of opening a window.
+        from pathlib import Path
+        from windows_update import verifier_main
+        if len(argv) == 2 and argv[0] == '--verify-update':
+            request = Path(argv[1])
+            return verifier_main(request, request.with_name('report.json'))
+        return 21  # unusable request; the caller reports a generic verification failure
     if len(argv) == 2 and argv[0] == '--location-self-test':
         # Explicit diagnostic: real local positioning only; no controller/school API.
         from pathlib import Path

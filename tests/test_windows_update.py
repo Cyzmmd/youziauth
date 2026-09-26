@@ -1,245 +1,272 @@
 # Copyright (C) 2026 yoouzic
 # SPDX-License-Identifier: GPL-3.0-only
 
+"""The updater must accept only releases signed by the pinned key.
+
+These tests drive the real verification path with a throwaway key patched in for
+the duration of each test. The production pin is never used as a fixture, and no
+private key ever enters the repository.
+"""
+
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
-import os
 import shutil
 import subprocess
-import sys
 import tempfile
-import time
 import unittest
-from contextlib import chdir
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import ed25519
 import windows_update as update
 
 
 VERSION = "1.2.3"
 UPGRADE_CODE = "{D029E636-7E7E-42EE-8B38-C2D455AD2AA1}"
-SUBJECT = "CN=Test Publisher, O=Test Organisation, C=CN"
+PROPERTIES = {
+    "ProductName": "youziauth",
+    "Manufacturer": "yoouzic",
+    "ProductVersion": VERSION,
+    "UpgradeCode": UPGRADE_CODE,
+}
 
 
-def valid_result():
-    # Certificate names are fixtures, never production trust anchors.
-    return {
-        "exe": {"status": "Valid", "subject": SUBJECT},
-        "msi": {"status": "Valid", "subject": SUBJECT, "timestamp": True},
-        "properties": {
-            "ProductName": "youziauth",
-            "Manufacturer": "yoouzic",
-            "ProductVersion": VERSION,
-            "UpgradeCode": UPGRADE_CODE,
-        },
-    }
+def encoded(script):
+    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
 
 
-class WindowsUpdateTests(unittest.TestCase):
+class SignedRelease:
+    """A throwaway release key plus a signed package, rebuilt on demand."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        root.mkdir(parents=True, exist_ok=True)
+        self.secret = ed25519.generate_secret_key()
+        self.public = ed25519.derive_public_key(self.secret)
+        self.msi = root / "package.msi"
+        self.msi.write_bytes(b"not an installer\x00signed fixture")
+        self.sign()
+
+    def sign(self, version: str = VERSION, contents: bytes | None = None) -> None:
+        if contents is not None:
+            self.msi.write_bytes(contents)
+        self.version = version
+        self.sha256 = hashlib.sha256(self.msi.read_bytes()).hexdigest()
+        self.size = self.msi.stat().st_size
+        self.payload = update.canonical_payload(version, self.sha256, self.size)
+        self.signature = ed25519.sign(self.payload, self.secret)
+
+    def request(self, **overrides) -> dict:
+        body = {
+            "msi": str(self.msi), "version": self.version, "bytes": self.size,
+            "sha256": self.sha256, "signature": self.signature.hex(),
+            "payload": self.payload.decode("ascii"), "properties": dict(PROPERTIES),
+        }
+        body.update(overrides)
+        return body
+
+    def pin(self, test: unittest.TestCase) -> None:
+        """Make the module under test trust this fixture key instead of production."""
+        patched = patch.object(update, "PUBLIC_KEY_B64",
+                               base64.b64encode(self.public).decode("ascii"))
+        patched.start()
+        test.addCleanup(patched.stop)
+
+
+class VerifierTests(unittest.TestCase):
+    """The frozen-application verifier, exercised directly."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.msi = self.root / "更新 ' ; $([x]) & package.msi"
-        self.msi.write_bytes(b"not an installer\x00test fixture")
+        self.release = SignedRelease(self.root)
+        self.release.pin(self)
+
+    def run_verifier(self, request: dict | None = None, **overrides) -> int:
+        body = self.release.request(**overrides) if request is None else request
+        source = self.root / "request.json"
+        report = self.root / "report.json"
+        report.unlink(missing_ok=True)
+        source.write_text(json.dumps(body), encoding="utf-8")
+        return update.verifier_main(source, report)
+
+    def test_valid_signature_is_accepted_and_reported(self):
+        source = self.root / "request.json"
+        report = self.root / "report.json"
+        source.write_text(json.dumps(self.release.request()), encoding="utf-8")
+        self.assertEqual(update.verifier_main(source, report), 0)
+        body = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(body["digest"], self.release.sha256)
+        self.assertEqual(body["signature"], self.release.signature.hex())
+        self.assertEqual(body["payload"], self.release.payload.decode("ascii"))
+        self.assertEqual(body["properties"], PROPERTIES)
+
+    def test_tampered_payload_is_rejected(self):
+        for key, value in (("version", "9.9.9"), ("bytes", 1), ("product", "other"),
+                           ("manufacturer", "other"),
+                           ("upgrade", "{00000000-0000-0000-0000-000000000000}")):
+            with self.subTest(key=key):
+                payload = json.loads(self.release.payload)
+                payload[key] = value
+                self.assertEqual(self.run_verifier(payload=json.dumps(payload, separators=(",", ":"))), 12)
+
+    def test_payload_must_agree_with_the_requested_version_and_size(self):
+        other = json.loads(self.release.payload)
+        other["sha256"] = "0" * 64
+        self.assertEqual(self.run_verifier(payload=json.dumps(other, separators=(",", ":"))), 12)
+        bad = json.loads(self.release.payload)
+        bad["bytes"] = self.release.size + 1
+        self.assertEqual(self.run_verifier(payload=json.dumps(bad, separators=(",", ":"))), 12)
+
+    def test_signature_from_another_key_is_rejected(self):
+        forged = ed25519.sign(self.release.payload, ed25519.generate_secret_key())
+        self.assertEqual(self.run_verifier(signature=forged.hex()), 12)
+
+    def test_signature_for_a_different_package_is_rejected(self):
+        # A genuine signature that covers different bytes must not transfer.
+        other = SignedRelease(self.root / "other")
+        self.assertEqual(self.run_verifier(signature=other.signature.hex()), 12)
+
+    def test_malformed_signatures_versions_and_sizes_are_rejected(self):
+        for signature in ("", "zz" * 64, "ab" * 63, "ab" * 65, 123, None):
+            with self.subTest(signature=signature):
+                self.assertEqual(self.run_verifier(signature=signature), 11)
+        for version in ("1.2", "v1.2.3", "01.2.3", "1.2.3.4", "1.2.3-rc.1", 1.2, None, "256.0.0"):
+            with self.subTest(version=version):
+                self.assertEqual(self.run_verifier(version=version), 21)
+        for size in (0, -1, True, "12", None, 2**33):
+            with self.subTest(size=size):
+                self.assertEqual(self.run_verifier(bytes=size), 15)
+
+    def test_missing_or_unreadable_package_is_rejected(self):
+        self.assertEqual(self.run_verifier(msi=str(self.root / "missing.msi")), 21)
+        self.assertEqual(self.run_verifier(msi=str(self.root)), 21)
+
+    def test_request_digest_cannot_substitute_for_the_real_one(self):
+        # The verifier re-hashes the file and the payload must carry that digest.
+        body = self.release.request()
+        body["payload"] = body["payload"].replace(self.release.sha256, "0" * 64)
+        self.assertEqual(self.run_verifier(body), 12)
+
+    def test_non_ascii_and_oversized_payloads_are_rejected(self):
+        self.assertEqual(self.run_verifier(payload="\u4e2d" * 10), 12)
+        self.assertEqual(self.run_verifier(payload="x" * 5000), 12)
+        for payload in ("", "not json", "[]", "null"):
+            with self.subTest(payload=payload):
+                self.assertEqual(self.run_verifier(payload=payload), 12)
+
+    def test_verifier_never_writes_a_report_on_failure(self):
+        report = self.root / "report.json"
+        source = self.root / "request.json"
+        source.write_text(json.dumps(self.release.request(signature="ab" * 64)), encoding="utf-8")
+        self.assertEqual(update.verifier_main(source, report), 12)
+        self.assertFalse(report.exists())
+
+    def test_unwritable_report_location_is_reported_not_raised(self):
+        source = self.root / "request.json"
+        source.write_text(json.dumps(self.release.request()), encoding="utf-8")
+        self.assertEqual(update.verifier_main(source, self.root / "missing" / "report.json"), 21)
+
+    def test_canonical_payload_is_stable_and_ascii(self):
+        payload = update.canonical_payload(VERSION, "AB" * 32, 7)
+        body = json.loads(payload)
+        self.assertEqual(body["sha256"], "ab" * 32)
+        self.assertEqual(body["version"], VERSION)
+        self.assertEqual(body["bytes"], 7)
+        self.assertEqual(body["upgrade"], UPGRADE_CODE)
+        self.assertEqual(body["product"], "youziauth")
+        self.assertEqual(body["manufacturer"], "yoouzic")
+        self.assertEqual(payload, update.canonical_payload(VERSION, "ab" * 32, 7))
+        payload.decode("ascii")  # must never contain non-ASCII characters
+        for bad in (None, 1, "1.2", "v1.2.3", "1.2.3\n"):
+            with self.subTest(version=bad):
+                with self.assertRaises(update.UpdateVerificationError):
+                    update._version(bad)
+
+    def test_public_key_pin_is_a_32_byte_valid_point(self):
+        key = update.public_key()
+        self.assertEqual(len(key), ed25519.PUBLIC_KEY_BYTES)
+        self.assertEqual(base64.b64encode(key).decode("ascii"), update.PUBLIC_KEY_B64)
+        for broken in ("", "not base64!", base64.b64encode(b"short").decode("ascii")):
+            with self.subTest(broken=broken):
+                with patch.object(update, "PUBLIC_KEY_B64", broken):
+                    with self.assertRaises(update.UpdateVerificationError):
+                        update.public_key()
+
+    def test_wrong_pin_rejects_a_genuinely_signed_release(self):
+        # If the compiled-in key is not the release key, nothing may install.
+        with patch.object(update, "PUBLIC_KEY_B64",
+                          base64.b64encode(ed25519.derive_public_key(
+                              ed25519.generate_secret_key())).decode("ascii")):
+            self.assertEqual(self.run_verifier(), 12)
+
+
+class GuardTests(unittest.TestCase):
+    """Input validation must run before any process, lock, or COM boundary."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.release = SignedRelease(self.root)
+        self.release.pin(self)
         self.exe = self.root / "youziauth.exe"
-        self.exe.write_bytes(b"not executable; signature API is mocked")
-        self.sha256 = hashlib.sha256(self.msi.read_bytes()).hexdigest()
-        self.events = []
-        self.result = valid_result()
-        self.api = Mock()
-        self.states = [("launch", {"pid": 456}), ("final", {"code": 3010})]
-        self.directory = None
-
-        def system_directory(buffer, size):
-            buffer.value = str(self.root / "System32")
-            return len(buffer.value)
-
-        self.api.GetSystemDirectoryW.side_effect = system_directory
-        self.api.OpenProcess.return_value = 123
-        self.api.WaitForSingleObject.side_effect = self.advance_worker
-        self.api.CloseHandle.side_effect = lambda handle: self.events.append("close") or 1
-        make_directory = tempfile.mkdtemp
-
-        def private_directory(**options):
-            directory = make_directory(**options)
-            self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
-            return directory
-
-        self.patches = [
-            patch.object(update.tempfile, "mkdtemp", side_effect=private_directory),
-            patch.object(update.sys, "platform", "win32"),
-            patch.object(update.sys, "frozen", True, create=True),
-            patch.object(update.sys, "executable", str(self.exe)),
-            patch.object(update.ctypes, "WinDLL", return_value=self.api, create=True),
-            patch.object(update.subprocess, "run", side_effect=self.run_powershell),
-            patch.object(update.subprocess, "Popen", side_effect=AssertionError("direct child launch")),
-        ]
-        for item in self.patches:
+        self.exe.write_bytes(b"not executable; the system boundary is mocked")
+        for item in (patch.object(update.sys, "platform", "win32"),
+                     patch.object(update.sys, "frozen", True, create=True),
+                     patch.object(update.sys, "executable", str(self.exe))):
             item.start()
             self.addCleanup(item.stop)
-        self.run = update.subprocess.run
-        self.popen = update.subprocess.Popen
-        self.callback = Mock(side_effect=lambda: self.events.append("callback"))
 
-    def run_powershell(self, command, **kwargs):
-        if command[-1] == update._ENCODED_COMMAND:
-            self.events.append("verify")
-            return subprocess.CompletedProcess(command, 0, json.dumps(self.result), "")
-        self.assertEqual(command[-1], update._ENCODED_LAUNCHER)
-        self.events.append("launcher")
-        self.request = json.loads(base64.b64decode(kwargs["env"]["YOUZIAUTH_UPDATE_REQUEST"]))
-        self.directory = Path(self.request["directory"])
-        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
-        return subprocess.CompletedProcess(command, 0, '{"pid":321}', "")
-
-    def advance_worker(self, handle, milliseconds):
-        self.assertEqual(handle, 123)
-        self.assertTrue(0 < milliseconds <= 1000)
-        if not self.states:
-            return 0
-        name, status = self.states.pop(0)
-        (self.directory / (name + ".json")).write_text(json.dumps(status), encoding="utf-8")
-        self.events.append(name)
-        return 258 if self.states else 0
-
-    def verify(self, **overrides):
-        arguments = dict(path=self.msi, executable=self.exe, version=VERSION, sha256=self.sha256)
+    def validate(self, **overrides):
+        arguments = dict(path=self.release.msi, executable=self.exe, version=VERSION,
+                         sha256=self.release.sha256, signature=self.release.signature)
         arguments.update(overrides)
-        return update.verify_msi(**arguments)
+        return update._validate_inputs(**arguments)
 
-    def install(self, **overrides):
-        arguments = dict(path=self.msi, executable=self.exe, version=VERSION,
-                         sha256=self.sha256, on_launch=self.callback)
-        arguments.update(overrides)
-        return update.install_msi(**arguments)
+    def test_valid_inputs_are_accepted(self):
+        msi, anchor, version, sha256, signature, size = self.validate()
+        self.assertEqual(msi, self.release.msi.resolve())
+        self.assertEqual(anchor, self.exe.resolve())
+        self.assertEqual((version, sha256, signature.hex(), size),
+                         (VERSION, self.release.sha256, self.release.signature.hex(), self.release.size))
 
-    def test_public_verifier_accepts_valid_package_without_launching(self):
-        self.assertIsNone(self.verify())
-        self.popen.assert_not_called()
+    def test_signature_accepts_hex_and_raw_bytes(self):
+        self.assertEqual(self.validate(signature=self.release.signature.hex())[4], self.release.signature)
+        self.assertEqual(self.validate(signature=self.release.signature)[4], self.release.signature)
+        self.assertEqual(
+            self.validate(signature=self.release.signature.hex().upper())[4], self.release.signature)
 
-    def test_sha256_mismatch_rejects_before_system_process(self):
-        with self.assertRaisesRegex(update.UpdateVerificationError, "哈希"):
-            self.verify(sha256="0" * 64)
-        self.run.assert_not_called()
-        self.popen.assert_not_called()
-
-    def test_uppercase_sha256_is_accepted(self):
-        self.assertIsNone(self.verify(sha256=self.sha256.upper()))
-
-    def test_each_untrusted_signature_is_rejected(self):
-        for target in ("exe", "msi"):
-            for status in ("NotSigned", "HashMismatch", "NotTrusted", "UnknownError", "valid", None):
-                with self.subTest(target=target, status=status):
-                    self.result = valid_result()
-                    self.result[target]["status"] = status
-                    with self.assertRaises(update.UpdateVerificationError):
-                        self.verify()
-        self.popen.assert_not_called()
-
-    def test_exe_rejection_explains_official_signed_install_requirement(self):
-        self.result["exe"]["status"] = "NotSigned"
-        with self.assertRaisesRegex(update.UpdateVerificationError, "官方签名安装版"):
-            self.verify()
-
-    def test_full_subject_must_match_exactly(self):
-        for subject in ("CN=Test Publisher", SUBJECT.lower(), SUBJECT + " ", "CN=Other", "", None):
-            with self.subTest(subject=subject):
-                self.result = valid_result()
-                self.result["msi"]["subject"] = subject
+    def test_bad_signatures_are_rejected_before_any_boundary(self):
+        for signature in (None, "", "ab" * 63, "ab" * 65, "zz" * 64, 123, b"short", ["x"]):
+            with self.subTest(signature=str(signature)[:16]):
                 with self.assertRaises(update.UpdateVerificationError):
-                    self.verify()
+                    self.validate(signature=signature)
 
-    def test_no_publisher_name_is_pinned_in_code(self):
-        self.result["exe"]["subject"] = "CN=Another locally trusted publisher, O=Renewable"
-        self.result["msi"]["subject"] = self.result["exe"]["subject"]
-        self.assertIsNone(self.verify())
-
-    def test_empty_local_signer_cannot_anchor_trust(self):
-        for subject in ("", " ", None, 123):
-            with self.subTest(subject=subject):
-                self.result["exe"]["subject"] = subject
-                self.result["msi"]["subject"] = subject
-                with self.assertRaisesRegex(update.UpdateVerificationError, "官方签名安装版"):
-                    self.verify()
-
-    def test_timestamp_must_be_present_not_truthy(self):
-        for timestamp in (False, None, "true", 1):
-            with self.subTest(timestamp=timestamp):
-                self.result["msi"]["timestamp"] = timestamp
-                with self.assertRaisesRegex(update.UpdateVerificationError, "时间戳"):
-                    self.verify()
-
-    def test_each_product_property_is_required_and_exact(self):
-        wrong_values = {
-            "ProductName": "another-app",
-            "Manufacturer": "another-company",
-            "ProductVersion": "1.2.4",
-            "UpgradeCode": "{00000000-0000-0000-0000-000000000000}",
-        }
-        for name, wrong in wrong_values.items():
-            for value in (wrong, None, ""):
-                with self.subTest(property=name, value=value):
-                    self.result = valid_result()
-                    self.result["properties"][name] = value
-                    with self.assertRaises(update.UpdateVerificationError):
-                        self.verify()
-            self.result = valid_result()
-            del self.result["properties"][name]
-            with self.assertRaises(update.UpdateVerificationError):
-                self.verify()
-
-    def test_signature_failure_takes_precedence_over_product_failure(self):
-        result = valid_result()
-        result["exe"]["status"] = "NotSigned"
-        result["properties"] = None
-        with self.assertRaisesRegex(update.UpdateVerificationError, "官方签名安装版"):
-            update._verify_result(result, VERSION)
-
-    def test_malformed_system_json_fails_closed_without_raw_details(self):
-        for output in ("not json; SECRET", "[]", "null", '{}', '{"exe": []}',
-                       json.dumps({**valid_result(), "properties": []})):
-            with self.subTest(output=output):
-                self.run.side_effect = None
-                self.run.return_value = subprocess.CompletedProcess([], 0, output, "SECRET OS")
-                with self.assertRaises(update.UpdateVerificationError) as caught:
-                    self.verify()
-                self.assertNotIn("SECRET", str(caught.exception))
-                self.assertRegex(str(caught.exception), "[\u4e00-\u9fff]")
-
-    def test_fixed_system_failures_are_sanitized(self):
-        for code, message in ((10, "官方签名安装版"), (11, "签名"), (12, "时间戳"),
-                              (13, "发布者"), (14, "产品"), (99, "验证")):
-            with self.subTest(code=code):
-                self.run.side_effect = None
-                self.run.return_value = subprocess.CompletedProcess([], code, "SECRET script", "SECRET OS")
-                with self.assertRaisesRegex(update.UpdateVerificationError, message) as caught:
-                    self.verify()
-                self.assertNotIn("SECRET", str(caught.exception))
-
-    def test_invalid_inputs_do_not_reach_system_boundary(self):
-        invalid = [
-            {"version": item} for item in (None, 123, "1.2", "v1.2.3", "1.2.3.4", "01.2.3",
-                                          "1.2.3-beta", "1.2.3\n", "１.2.3", "1.2.3'; exit 0", "256.0.0")
-        ] + [{"sha256": item} for item in (None, 123, "", "f" * 63, "g" * 64, "f" * 64 + "\n")]
-        invalid += [{"path": item} for item in (None, str(self.msi), self.root,
-                                                self.root / "missing.msi", Path("bad\x00.msi"))]
-        for overrides in invalid:
-            with self.subTest(overrides=overrides):
+    def test_bad_versions_hashes_and_paths_are_rejected(self):
+        for version in (None, 123, "1.2", "v1.2.3", "1.2.3.4", "01.2.3", "1.2.3-beta",
+                        "1.2.3\n", "\uff11.2.3", "1.2.3'; exit 0", "256.0.0"):
+            with self.subTest(version=version):
                 with self.assertRaises(update.UpdateVerificationError):
-                    self.verify(**overrides)
-        self.run.assert_not_called()
-        self.popen.assert_not_called()
+                    self.validate(version=version)
+        for sha256 in (None, 123, "", "f" * 63, "g" * 64, "f" * 64 + "\n"):
+            with self.subTest(sha256=sha256):
+                with self.assertRaises(update.UpdateVerificationError):
+                    self.validate(sha256=sha256)
+        for path in (None, str(self.release.msi), self.root, self.root / "missing.msi",
+                     Path("bad\x00.msi")):
+            with self.subTest(path=path):
+                with self.assertRaises(update.UpdateVerificationError):
+                    self.validate(path=path)
 
-    def test_source_build_cannot_supply_an_alternate_signed_exe(self):
+    def test_source_build_cannot_run_the_installer(self):
         with patch.object(update.sys, "frozen", False):
-            with self.assertRaisesRegex(update.UpdateVerificationError, "官方签名安装版"):
-                self.verify()
-        self.run.assert_not_called()
+            with self.assertRaisesRegex(update.UpdateVerificationError, update.OFFICIAL_BUILD_REQUIRED[:6]):
+                self.validate()
 
     def test_executable_must_be_the_running_packaged_executable(self):
         other = self.root / "other.exe"
@@ -247,408 +274,219 @@ class WindowsUpdateTests(unittest.TestCase):
         for executable in (other, self.root, str(self.exe)):
             with self.subTest(executable=executable):
                 with self.assertRaises(update.UpdateVerificationError):
-                    self.verify(executable=executable)
+                    self.validate(executable=executable)
         with patch.object(update.sys, "executable", str(other)):
-            with self.assertRaisesRegex(update.UpdateVerificationError, "官方签名安装版"):
-                self.verify(executable=other)
-        self.run.assert_not_called()
+            with self.assertRaisesRegex(update.UpdateVerificationError, update.OFFICIAL_BUILD_REQUIRED[:6]):
+                self.validate(executable=other)
 
-    def test_none_executable_defaults_to_current_packaged_executable(self):
-        self.assertIsNone(self.verify(executable=None))
-        self.assertEqual(self.run.call_args.kwargs["env"]["YOUZIAUTH_UPDATE_EXE"], str(self.exe))
+    def test_installer_must_be_an_msi(self):
+        renamed = self.root / "package.exe"
+        renamed.write_bytes(self.release.msi.read_bytes())
+        with self.assertRaises(update.UpdateVerificationError):
+            self.validate(path=renamed)
 
     def test_non_windows_is_explicitly_rejected(self):
         with patch.object(update.sys, "platform", "linux"):
-            with self.assertRaisesRegex(update.UpdateVerificationError, "Windows"):
-                self.verify()
-        self.run.assert_not_called()
-
-    def test_paths_are_absolute_and_data_never_becomes_powershell_source(self):
-        self.verify()
-        first_command = self.run.call_args.args[0]
-        options = self.run.call_args.kwargs
-        self.assertEqual(Path(first_command[0]), self.root / "System32/WindowsPowerShell/v1.0/powershell.exe")
-        self.assertEqual(first_command[1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
-        self.assertEqual(len(first_command), 5)
-        source = base64.b64decode(first_command[4]).decode("utf-16le")
-        self.assertNotIn(str(self.msi), source)
-        self.assertIs(options["shell"], False)
-        self.assertEqual(options["encoding"].lower().replace("-", ""), "utf8")
-        self.assertTrue(0 < options["timeout"] <= 60)
-        self.assertEqual(options["creationflags"], 0x08000000)
-        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.msi))
-        # TEMP and the checkout may be on different Windows drives.
-        with chdir(self.root), patch.dict(os.environ, {"SystemRoot": "C:/attacker", "PATH": "C:/attacker"}):
-            self.verify(path=Path(self.msi.name))
-        self.assertEqual(self.run.call_args.args[0], first_command)
-        self.assertEqual(self.run.call_args.kwargs["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.msi))
-
-    def test_powershell_timeout_and_launch_errors_are_sanitized(self):
-        for error in (subprocess.TimeoutExpired("SECRET SCRIPT", 60), OSError("SECRET OS"),
-                      UnicodeError("SECRET ENCODING")):
-            with self.subTest(error=type(error).__name__):
-                self.run.side_effect = error
-                with self.assertRaises(update.UpdateVerificationError) as caught:
-                    self.verify()
-                self.assertNotIn("SECRET", str(caught.exception))
-                self.assertTrue(caught.exception.__suppress_context__)
-        self.popen.assert_not_called()
-
-    def test_system_directory_failure_is_not_replaced_with_path_lookup(self):
-        self.api.GetSystemDirectoryW.side_effect = None
-        self.api.GetSystemDirectoryW.return_value = 0
-        with self.assertRaises(update.UpdateVerificationError):
-            self.verify()
-        self.run.assert_not_called()
-
-    def test_install_does_not_create_msiexec_in_desktop_process_tree(self):
-        self.install()
-        self.popen.assert_not_called()
-        self.api.CreateFileW.assert_not_called()
-
-    def test_install_waits_for_final_and_returns_actual_exit_code(self):
-        for code in (0, 1602, 1603, 3010):
-            with self.subTest(code=code):
-                self.states = [("launch", {"pid": 456}), ("final", {"code": code})]
-                self.events.clear()
-                self.assertEqual(self.install(), code)
-                self.assertEqual(self.events, ["launcher", "launch", "callback", "final", "close"])
-                self.assertFalse(self.directory.exists())
-        self.api.OpenProcess.assert_called_with(0x00100000, False, 321)
-
-    def test_install_handoff_uses_private_local_state_and_fixed_commands(self):
-        with patch.dict(os.environ, {"SystemRoot": "C:/attacker", "PATH": "C:/attacker",
-                                     "YOUZIAUTH_UPDATE_REQUEST": "untrusted"}):
-            self.install()
-        command = self.run.call_args.args[0]
-        options = self.run.call_args.kwargs
-        self.assertEqual(Path(command[0]), self.root / "System32/WindowsPowerShell/v1.0/powershell.exe")
-        self.assertEqual(command[1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
-        self.assertIs(options["shell"], False)
-        self.assertLessEqual(options["timeout"], 20)
-        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.msi))
-        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_EXE"], str(self.exe))
-        self.assertEqual(self.request["sha256"], self.sha256)
-        self.assertEqual(self.request["properties"], valid_result()["properties"])
-        self.assertTrue(self.directory.is_absolute())
-        self.assertNotEqual(self.directory, self.root)
-        self.assertNotIn(str(self.msi), base64.b64decode(command[-1]).decode("utf-16le"))
-        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_VERIFY"], update._ENCODED_COMMAND)
-        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_WORKER"], update._ENCODED_WORKER)
-
-    def test_worker_early_errors_never_notify_launch(self):
-        for error in (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 999):
-            with self.subTest(error=error):
-                self.states = [("final", {"error": error})]
-                with self.assertRaises(update.UpdateVerificationError):
-                    self.install()
-                self.callback.assert_not_called()
-
-    def test_launcher_does_not_decode_localized_stderr(self):
-        self.install()
-        self.assertEqual(self.run.call_args.kwargs.get("stderr"), subprocess.DEVNULL)
-        self.assertEqual(self.run.call_args.kwargs.get("stdout"), subprocess.PIPE)
-
-    def test_launcher_failures_are_sanitized(self):
-        for error in (OSError("SECRET"), subprocess.TimeoutExpired("SECRET", 20), UnicodeError("SECRET")):
-            self.run.side_effect = error
-            with self.assertRaises(update.UpdateVerificationError) as caught:
-                self.install()
-            self.assertNotIn("SECRET", str(caught.exception))
-        self.callback.assert_not_called()
-
-    def test_invalid_callback_prevents_any_process_or_lock(self):
-        with self.assertRaises(update.UpdateVerificationError):
-            self.install(on_launch=None)
-        self.run.assert_not_called()
-        self.popen.assert_not_called()
-        self.api.OpenProcess.assert_not_called()
-
-    def test_callback_failure_still_waits_for_final(self):
-        def broken_callback():
-            self.events.append("callback")
-            raise RuntimeError("SECRET callback")
-
-        with self.assertRaisesRegex(update.UpdateVerificationError, "通知") as caught:
-            self.install(on_launch=broken_callback)
-        self.assertNotIn("SECRET", str(caught.exception))
-        self.assertEqual(self.events, ["launcher", "launch", "callback", "final", "close"])
-
-    def test_system_exit_callback_still_waits_for_final(self):
-        self.callback.side_effect = SystemExit(7)
-        with self.assertRaises(SystemExit) as caught:
-            self.install()
-        self.assertEqual(caught.exception.code, 7)
-        self.assertIn("final", self.events)
-
-    def test_dead_worker_without_final_is_not_waited_forever(self):
-        for states in ([], [("launch", {"pid": 456})]):
-            with self.subTest(states=states):
-                self.states = list(states)
-                with self.assertRaisesRegex(update.UpdateVerificationError, "意外退出"):
-                    self.install()
-
-    def test_process_watch_failure_does_not_kill_or_clean_live_worker(self):
-        self.api.WaitForSingleObject.side_effect = OSError("SECRET wait")
-        with self.assertRaises(update.UpdateVerificationError) as caught:
-            self.install()
-        self.assertNotIn("SECRET", str(caught.exception))
-        self.assertTrue(self.directory.exists())
-        self.api.TerminateProcess.assert_not_called()
-        self.popen.assert_not_called()
-
-    def test_unobservable_worker_is_not_waited_forever(self):
-        self.api.OpenProcess.return_value = 0
-        with self.assertRaisesRegex(update.UpdateVerificationError, "无法观察"):
-            self.install()
-        self.api.WaitForSingleObject.assert_not_called()
-        self.callback.assert_not_called()
-        self.assertTrue(self.directory.exists())
-
-    def test_live_worker_startup_is_bounded(self):
-        with patch.object(update.time, "monotonic", side_effect=[0, 121]):
-            with self.assertRaisesRegex(update.UpdateVerificationError, "超时"):
-                self.install()
-        self.callback.assert_not_called()
-        self.assertTrue(self.directory.exists())
-
-    def test_final_code_without_launch_is_not_success(self):
-        self.states = [("final", {"code": 0})]
-        with self.assertRaises(update.UpdateVerificationError):
-            self.install()
-        self.callback.assert_not_called()
-
-    def test_fast_worker_final_still_delivers_callback_once(self):
-        original = self.run_powershell
-
-        def finished_worker(command, **options):
-            result = original(command, **options)
-            self.advance_worker(123, 100)
-            self.advance_worker(123, 100)
-            return result
-
-        self.run.side_effect = finished_worker
-        self.api.OpenProcess.return_value = 0
-        self.assertEqual(self.install(), 3010)
-        self.callback.assert_called_once_with()
-
-    def test_malformed_status_never_reports_completion(self):
-        cases = [("launch", {"pid": True}), ("launch", {"pid": -1}),
-                 ("final", {"code": True}), ("final", {"code": 0, "error": 10}),
-                 ("final", {"error": "SECRET"}), ("final", {}),
-                 ("final", {"padding": "SECRET" * 1000})]
-        for name, status in cases:
-            with self.subTest(name=name, status=str(status)[:60]):
-                self.states = [(name, status)]
-                with self.assertRaises(update.UpdateVerificationError) as caught:
-                    self.install()
-                self.assertNotIn("SECRET", str(caught.exception))
-        self.callback.assert_not_called()
+            with self.assertRaises(update.UpdateVerificationError):
+                self.validate()
 
 
-def encoded(script):
-    return base64.b64encode(script.encode("utf-16le")).decode("ascii")
-
-
-_SAFE_VERIFIER = r"""
-[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
-[Console]::Out.Write([Text.Encoding]::UTF8.GetString(
-    [Convert]::FromBase64String($env:YOUZIAUTH_TEST_RESULT)))
-exit 0
-"""
-_SAFE_INSTALLER = r"""
-$request = [Text.Encoding]::UTF8.GetString(
-    [Convert]::FromBase64String($env:YOUZIAUTH_UPDATE_REQUEST)) | ConvertFrom-Json
-$release = [IO.Path]::Combine($request.directory, 'release')
-$timer = [Diagnostics.Stopwatch]::StartNew()
-while (-not [IO.File]::Exists($release) -and $timer.Elapsed.TotalSeconds -lt 15) {
-    Start-Sleep -Milliseconds 50
-}
-exit ([int]$env:YOUZIAUTH_TEST_CODE)
-"""
-_SAFE_START = r"""
-$processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name)
-$boundary = @{ file = $start.FileName; arguments = $start.Arguments; shell = $start.UseShellExecute;
-               worker = $PID; launcher = [int]$env:YOUZIAUTH_UPDATE_LAUNCHER; processes = $processes }
-[IO.File]::WriteAllText([IO.Path]::Combine($directory, 'boundary.json'),
-                       ($boundary | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding($false)))
-$start.FileName = $powershell
-$start.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + $env:YOUZIAUTH_TEST_INSTALLER
-$start.CreateNoWindow = $true
-$installer = [Diagnostics.Process]::Start($start)
-"""
-
-
-@unittest.skipUnless(os.name == "nt", "safe native boundary checks require Windows")
 class NativeWorkerTests(unittest.TestCase):
+    """The detached worker must re-verify under its own exclusive file lock."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.msi = self.root / "无签名 '$([x]); & file.msi"
-        self.msi.write_bytes(b"This is deliberately not a Windows Installer database.")
-        self.sha256 = hashlib.sha256(self.msi.read_bytes()).hexdigest()
+        self.release = SignedRelease(self.root)
+        self.release.pin(self)
         self.anchor = update._system_tool("WindowsPowerShell/v1.0/powershell.exe")
         self.callback = Mock()
-        self.sequence = 0
 
-    def start(self, digest=None):
-        self.sequence += 1
-        self.directory = self.root / str(self.sequence)
-        self.directory.mkdir(mode=0o700)
-        pid = update._start_worker(self.msi, self.anchor, VERSION, digest or self.sha256, self.directory)
-        api = update._kernel32()
-        handle = api.OpenProcess(0x00100000, False, pid)
-        if handle:
-            directory = self.directory
+    def spawn_rejected_worker(self, sha256=None, signature=None, payload=None):
+        """Start a real worker whose package can never satisfy verification."""
+        directory = Path(tempfile.mkdtemp(prefix="youziauth-update-", dir=self.root)).resolve()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        return directory, update._start_worker(
+            self.release.msi, self.anchor, VERSION, self.release.size,
+            sha256 or self.release.sha256, signature or self.release.signature,
+            payload or self.release.payload, directory,
+        )
 
-            def finish():
-                if directory.exists():
-                    (directory / "release").touch(exist_ok=True)
-                try:
-                    self.assertEqual(api.WaitForSingleObject(handle, 25000), 0)
-                finally:
-                    api.CloseHandle(handle)
-            self.addCleanup(finish)
-        return pid
-
-    def safe_boundaries(self, result=None, code=3010):
-        original = "$installer = [Diagnostics.Process]::Start($start)"
-        self.assertEqual(update._WORKER.count(original), 1)
-        replacements = [
-            patch.object(update, "_ENCODED_WORKER", encoded(update._WORKER.replace(original, _SAFE_START))),
-            patch.object(update, "_ENCODED_COMMAND", encoded(_SAFE_VERIFIER)),
-            patch.dict(os.environ, {
-                "YOUZIAUTH_TEST_RESULT": base64.b64encode(json.dumps(
-                    valid_result() if result is None else result).encode("utf-8")).decode("ascii"),
-                "YOUZIAUTH_TEST_INSTALLER": encoded(_SAFE_INSTALLER), "YOUZIAUTH_TEST_CODE": str(code),
-            }),
-        ]
-        for replacement in replacements:
-            replacement.start()
-            self.addCleanup(replacement.stop)
-
-    def observe_error(self, message):
-        self.callback.reset_mock()
-        pid = self.start()
-        with self.assertRaisesRegex(update.UpdateVerificationError, message):
-            update._observe_worker(pid, self.directory, self.callback)
+    def test_worker_rejects_a_tampered_package(self):
+        # The request pins the original digest, so a changed file must not pass.
+        digest = self.release.sha256
+        self.release.msi.write_bytes(b"replaced whole package")
+        directory, pid = self.spawn_rejected_worker(sha256=digest)
+        with self.assertRaisesRegex(update.UpdateVerificationError, update.HASH_MISMATCH[:6]):
+            update._observe_worker(pid, directory, self.callback)
         self.callback.assert_not_called()
-        self.msi.write_bytes(self.msi.read_bytes())
 
-    def test_real_powershell_rejects_fake_msi_before_database_open(self):
-        with self.assertRaisesRegex(update.UpdateVerificationError, "MSI.*签名"):
-            update._powershell_result(self.msi, self.anchor)
+    def test_worker_rejects_a_signature_that_does_not_cover_the_package(self):
+        other = SignedRelease(self.root / "other")
+        directory, pid = self.spawn_rejected_worker(signature=other.signature)
+        with self.assertRaises(update.UpdateVerificationError):
+            update._observe_worker(pid, directory, self.callback)
+        self.callback.assert_not_called()
 
-    def test_complete_unmodified_worker_rejects_unsigned_msi(self):
-        self.observe_error("MSI.*签名")
+    def test_worker_rejects_a_payload_for_another_version(self):
+        forged = update.canonical_payload("9.9.9", self.release.sha256, self.release.size)
+        directory, pid = self.spawn_rejected_worker(payload=forged)
+        with self.assertRaises(update.UpdateVerificationError):
+            update._observe_worker(pid, directory, self.callback)
+        self.callback.assert_not_called()
 
-    def test_detached_worker_owns_lock_until_harmless_installer_exits(self):
-        self.safe_boundaries()
-        pid = self.start()
-        evidence = {}
+    def test_existing_writer_prevents_the_worker_read_lock(self):
+        directory, pid = self.spawn_rejected_worker()
+        with self.release.msi.open("r+b"):
+            with self.assertRaises(update.UpdateVerificationError):
+                update._observe_worker(pid, directory, self.callback)
+        self.callback.assert_not_called()
 
-        def launched():
-            self.assertFalse((self.directory / "final.json").exists())
-            evidence.update(json.loads((self.directory / "boundary.json").read_text(encoding="utf-8")))
-            self.assertEqual(Path(evidence["file"]), update._system_tool("msiexec.exe"))
-            self.assertEqual(evidence["arguments"], '/i "' + str(self.msi) + '" /norestart')
-            self.assertIs(evidence["shell"], False)
-            active = {item["ProcessId"]: item for item in evidence["processes"]}
-            self.assertNotIn(evidence["launcher"], active)
-            self.assertEqual(active[pid]["ParentProcessId"], evidence["launcher"])
-            desktop_tree = {os.getpid()}
-            desktop_tree.update(p for p, item in active.items() if item["Name"].lower() == "youziauth.exe")
-            while True:
-                children = {p for p, item in active.items() if item["ParentProcessId"] in desktop_tree}
-                if children <= desktop_tree:
-                    break
-                desktop_tree.update(children)
-            self.assertNotIn(pid, desktop_tree)
-            for operation in (lambda: self.msi.write_bytes(b"replace"), self.msi.unlink,
-                              lambda: self.msi.rename(self.root / "renamed.msi")):
-                with self.assertRaises(PermissionError):
-                    operation()
-            self.assertTrue(self.msi.read_bytes())
-            self.assertEqual(update._kernel32().WaitForSingleObject(self.worker_handle, 0), 258)
-            (self.directory / "release").touch()
 
-        api = update._kernel32()
-        self.worker_handle = api.OpenProcess(0x00100000, False, pid)
-        self.addCleanup(api.CloseHandle, self.worker_handle)
-        self.assertEqual(update._observe_worker(pid, self.directory, launched), 3010)
-        self.assertEqual(evidence["worker"], pid)
-        self.msi.write_bytes(b"released")
-        self.msi.unlink()
+class InstallGuardsTests(unittest.TestCase):
+    """install_msi must refuse before creating a worker when a check fails."""
 
-    def test_worker_waits_for_late_launcher_exit_before_starting_installer(self):
-        self.safe_boundaries()
-        delayed = update._LAUNCHER.replace("$worker.Dispose()", "Start-Sleep -Seconds 3\n    $worker.Dispose()")
-        with patch.object(update, "_ENCODED_LAUNCHER", encoded(delayed)):
-            pid = self.start()
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.release = SignedRelease(self.root)
+        self.release.pin(self)
+        self.exe = self.root / "youziauth.exe"
+        self.exe.write_bytes(b"not executable; the system boundary is mocked")
+        for item in (patch.object(update.sys, "platform", "win32"),
+                     patch.object(update.sys, "frozen", True, create=True),
+                     patch.object(update.sys, "executable", str(self.exe))):
+            item.start()
+            self.addCleanup(item.stop)
+        self.callback = Mock()
+        self.boundary = Mock(side_effect=AssertionError("worker must not start"))
+        for name in ("_start_worker", "_observe_worker", "_run_verifier"):
+            patched = patch.object(update, name, self.boundary)
+            patched.start()
+            self.addCleanup(patched.stop)
 
-        def launched():
-            boundary = json.loads((self.directory / "boundary.json").read_text(encoding="utf-8"))
-            self.assertNotIn(boundary["launcher"], {p["ProcessId"] for p in boundary["processes"]})
-            (self.directory / "release").touch()
+    def install(self, **overrides):
+        arguments = dict(path=self.release.msi, executable=self.exe, version=VERSION,
+                         sha256=self.release.sha256, on_launch=self.callback,
+                         signature=self.release.signature)
+        arguments.update(overrides)
+        return update.install_msi(**arguments)
 
-        self.assertEqual(update._observe_worker(pid, self.directory, launched), 3010)
+    def test_hash_mismatch_stops_before_verifier_or_worker(self):
+        with self.assertRaisesRegex(update.UpdateVerificationError, update.HASH_MISMATCH[:6]):
+            self.install(sha256="0" * 64)
+        self.boundary.assert_not_called()
+        self.callback.assert_not_called()
 
-    def test_expired_startup_cannot_launch_late(self):
-        self.safe_boundaries()
-        with patch.object(update.time, "time", return_value=0):
-            self.observe_error("超时")
+    def test_forged_signature_stops_before_verifier_or_worker(self):
+        other = SignedRelease(self.root / "other")
+        with self.assertRaisesRegex(update.UpdateVerificationError, update.SIGNATURE_REJECTED[:6]):
+            self.install(signature=other.signature)
+        self.boundary.assert_not_called()
+        self.callback.assert_not_called()
 
-    def test_safe_installer_cancel_and_success_codes_are_preserved(self):
-        for code in (0, 1602):
+    def test_invalid_callback_prevents_every_boundary(self):
+        with self.assertRaises(update.UpdateVerificationError):
+            self.install(on_launch=None)
+        self.boundary.assert_not_called()
+
+    def test_verifier_failure_code_becomes_the_user_message(self):
+        with patch.object(update, "_run_verifier", return_value=16):
+            with self.assertRaisesRegex(update.UpdateVerificationError, update.PROPERTY_MISMATCH[:10]):
+                self.install()
+
+    def test_verifier_runs_before_the_worker_starts(self):
+        events = []
+        with patch.object(update, "_run_verifier", side_effect=lambda *a: events.append("verify") or 0), \
+             patch.object(update, "_start_worker", side_effect=lambda *a: events.append("worker") or 4321), \
+             patch.object(update, "_observe_worker", side_effect=lambda *a: events.append("observe") or 3010):
+            self.assertEqual(self.install(), 3010)
+        self.assertEqual(events, ["verify", "worker", "observe"])
+
+
+class ProcessBoundaryTests(unittest.TestCase):
+    """Script and command construction must stay fixed and path-free."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.release = SignedRelease(self.root)
+        self.release.pin(self)
+        self.exe = self.root / "youziauth.exe"
+        self.exe.write_bytes(b"not executable; the system boundary is mocked")
+        self.anchor = self.root / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        self.api = Mock()
+        self.api.OpenProcess.return_value = 0
+        self.api.GetSystemDirectoryW.side_effect = self.system_directory
+        for item in (patch.object(update.sys, "platform", "win32"),
+                     patch.object(update.sys, "frozen", True, create=True),
+                     patch.object(update.sys, "executable", str(self.exe)),
+                     patch.object(update.ctypes, "WinDLL", return_value=self.api, create=True)):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def system_directory(self, buffer, size):
+        buffer.value = str(self.root / "System32")
+        return len(buffer.value)
+
+    def test_worker_receives_a_fixed_command_without_inlining_the_path(self):
+        directory = Path(tempfile.mkdtemp(prefix="youziauth-update-", dir=self.root)).resolve()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        completed = subprocess.CompletedProcess([], 0, '{"pid":321}', "")
+        with patch.object(update.subprocess, "run", return_value=completed) as run:
+            update._start_worker(self.release.msi, self.anchor, VERSION, self.release.size,
+                                 self.release.sha256, self.release.signature,
+                                 self.release.payload, directory)
+        command = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertEqual(Path(command[0]), self.anchor)
+        self.assertEqual(command[1:4], ["-NoProfile", "-NonInteractive", "-EncodedCommand"])
+        self.assertEqual(len(command), 5)
+        self.assertIs(options["shell"], False)
+        self.assertLessEqual(options["timeout"], 20)
+        self.assertEqual(options["creationflags"], 0x08000000)
+        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_MSI"], str(self.release.msi))
+        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_EXE"], str(self.anchor))
+        self.assertEqual(options["env"]["YOUZIAUTH_UPDATE_SIGNATURE"], self.release.signature.hex())
+        source = base64.b64decode(command[4]).decode("utf-16le")
+        self.assertNotIn(str(self.release.msi), source)
+        request = json.loads(base64.b64decode(options["env"]["YOUZIAUTH_UPDATE_REQUEST"]))
+        self.assertEqual(request["sha256"], self.release.sha256)
+        self.assertEqual(request["properties"], PROPERTIES)
+        self.assertEqual(request["signature"], self.release.signature.hex())
+        self.assertEqual(request["payload"], self.release.payload.decode("ascii"))
+        self.assertTrue(Path(options["env"]["YOUZIAUTH_UPDATE_REQUEST_FILE"]).is_file())
+        self.assertTrue(directory.is_absolute())
+        self.assertNotEqual(directory, self.root)
+
+    def test_worker_calls_the_verifier_by_request_file(self):
+        # The MSI path and payload travel through a file, so no externally
+        # controlled text can become part of a command line.
+        self.assertIn("--verify-update", update._WORKER)
+        self.assertIn("YOUZIAUTH_UPDATE_REQUEST_FILE", update._WORKER)
+        self.assertIn("YOUZIAUTH_UPDATE_RESPONSE_FILE", update._WORKER)
+        self.assertNotIn("YOUZIAUTH_UPDATE_PAYLOAD", update._WORKER)
+
+    def test_worker_and_launcher_scripts_are_encoded_once(self):
+        self.assertEqual(base64.b64decode(update._ENCODED_WORKER).decode("utf-16le"), update._WORKER)
+        self.assertEqual(base64.b64decode(update._ENCODED_LAUNCHER).decode("utf-16le"), update._LAUNCHER)
+        self.assertEqual(base64.b64decode(update._ENCODED_COMMAND).decode("utf-16le"), update._POWERSHELL)
+
+    def test_windowed_worker_reports_through_files_not_a_console(self):
+        # The worker runs inside a console-less build, so it must never write to
+        # stdout; it publishes status files and reads the verifier's report file.
+        self.assertNotIn("[Console]::Out", update._WORKER)
+        self.assertIn("Publish-Status", update._WORKER)
+        self.assertIn("ReadAllText", update._WORKER)
+
+    def test_errors_are_chinese_and_free_of_os_detail(self):
+        for code, message in update._ERRORS.items():
             with self.subTest(code=code):
-                self.safe_boundaries(code=code)
-                pid = self.start()
-                self.assertEqual(update._observe_worker(
-                    pid, self.directory, lambda: (self.directory / "release").touch()), code)
-
-    def test_changed_file_is_rehashed_before_verification_or_start(self):
-        self.safe_boundaries()
-        self.msi.write_bytes(b"changed after prior preview verification")
-        self.observe_error("哈希")
-
-    def test_existing_writer_prevents_worker_read_lock_and_launch(self):
-        self.safe_boundaries()
-        with self.msi.open("r+b"):
-            self.observe_error("锁定")
-
-    def test_worker_checks_all_four_product_properties(self):
-        for name in ("ProductName", "Manufacturer", "ProductVersion", "UpgradeCode"):
-            with self.subTest(name=name):
-                result = valid_result()
-                result["properties"][name] = "mismatch"
-                self.safe_boundaries(result)
-                self.observe_error("产品")
-
-    def test_worker_rejects_invalid_signature_result_and_timestamp(self):
-        cases = [("exe", "status", "NotSigned", "官方签名"),
-                 ("exe", "status", ["Valid"], "官方签名"),
-                 ("exe", "subject", " ", "官方签名"),
-                 ("msi", "status", "NotTrusted", "签名"),
-                 ("msi", "status", ["Valid"], "签名"),
-                 ("msi", "subject", SUBJECT.lower(), "发布者"),
-                 ("msi", "timestamp", "true", "时间戳"),
-                 ("msi", "timestamp", 1, "时间戳")]
-        for target, key, value, message in cases:
-            with self.subTest(target=target, key=key, value=value):
-                result = valid_result()
-                result[target][key] = value
-                self.safe_boundaries(result)
-                self.observe_error(message)
-
-    def test_worker_crash_without_status_is_observable(self):
-        with patch.object(update, "_ENCODED_WORKER", encoded("exit 42")):
-            started = time.monotonic()
-            pid = self.start()
-            with self.assertRaisesRegex(update.UpdateVerificationError, "意外退出"):
-                update._observe_worker(pid, self.directory, self.callback)
-        self.assertLess(time.monotonic() - started, 20)
-        self.callback.assert_not_called()
+                self.assertRegex(message, "[\u4e00-\u9fff]")
+                self.assertNotIn("C:\\", message)
 
 
 if __name__ == "__main__":

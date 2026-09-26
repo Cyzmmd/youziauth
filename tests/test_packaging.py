@@ -21,7 +21,11 @@ class PackagingWorkflowTests(unittest.TestCase):
             .splitlines()
             if line.strip() and not line.startswith("#")
         ]
-        self.assertEqual(lines, ["Pillow==12.2.0", "PyInstaller==6.16.0"])
+        # numpy 是验证码识别（captcha_ocr.py）的推理依赖：模型为纯 NumPy 前向，
+        # 不带深度学习框架。仍要求精确固定版本，避免构建产物随上游漂移。
+        self.assertEqual(
+            lines, ["Pillow==12.2.0", "PyInstaller==6.16.0", "numpy==2.4.4"]
+        )
         self.assertTrue(all("==" in line for line in lines))
 
     def test_pyinstaller_bundle_includes_third_party_license_materials(self):
@@ -185,10 +189,15 @@ class PayloadCompletenessTests(unittest.TestCase):
         text = ROOT.joinpath(".github", "workflows", "release.yml").read_text(
             encoding="utf-8"
         )
-        build = text.index("Build unsigned MSI")
-        sign = text.index("Submit SignPath request")
+        build = text.index("Build MSI")
+        sign = text.index("Sign MSI with the release key")
+        verify = text.index("Verify signed release")
+        publish = text.index("Publish signed release")
         self.assertIn("-VerifyPayload", text)
         self.assertLess(build, sign)
+        # The signature must be verified before anything is published.
+        self.assertLess(sign, verify)
+        self.assertLess(verify, publish)
 
     def test_pyinstaller_bundle_keeps_the_interpreter_standard_library(self):
         # The frozen interpreter cannot start without base_library.zip; it must stay

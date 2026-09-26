@@ -17,6 +17,9 @@ from windows_update import install_msi, verify_msi
 REPOSITORY = 'Cyzmmd/youziauth'
 LATEST_RELEASE_URL = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
 MAX_PACKAGE_BYTES = 1024 * 1024 * 1024
+# Every release must carry the installer plus both detached authenticators; a
+# release missing any of them is refused rather than silently downgraded.
+RELEASE_ASSETS = ('youziauth.msi', 'SHA256SUMS.txt', 'youziauth.msi.ed25519')
 
 
 def version_tuple(value):
@@ -74,10 +77,10 @@ def release_assets(data, version):
     if not isinstance(assets, list) or any(not isinstance(asset, dict) for asset in assets):
         raise ValueError('发布附件格式无效')
     result = {}
-    for name in ('youziauth.msi', 'SHA256SUMS.txt'):
+    for name in RELEASE_ASSETS:
         matches = [asset for asset in assets if asset.get('name') == name]
         if len(matches) != 1:
-            raise RuntimeError('最新版本缺少唯一的安装包或 SHA256SUMS.txt 校验文件，请等待发布完成后重试。')
+            raise RuntimeError(f'最新版本缺少唯一的发布附件 {name}，请等待发布完成后重试。')
         asset = matches[0]
         url = f'https://github.com/{REPOSITORY}/releases/download/v{version}/{name}'
         if asset.get('browser_download_url') != url or asset.get('state') != 'uploaded':
@@ -96,6 +99,13 @@ def read_checksum(url):
     if len(values) != 1:
         raise RuntimeError('安装包校验清单无效，请等待发布者修复后重试。')
     return values[0]
+
+
+def read_signature(url):
+    text = read_small(url, 32768).decode('utf-8-sig').strip()
+    if re.fullmatch(r'[0-9a-fA-F]{128}', text) is None:
+        raise RuntimeError('安装包发布签名无效，请等待发布者修复后重试。')
+    return text.lower()
 
 
 def file_digest(path):
@@ -213,6 +223,7 @@ class UpdateController:
         assets = release_assets(data, version)
         package = assets['youziauth.msi']
         digest = read_checksum(assets['SHA256SUMS.txt']['browser_download_url'])
+        signature = read_signature(assets['youziauth.msi.ed25519']['browser_download_url'])
         self._ensure_open()
         self._cache.mkdir(parents=True, exist_ok=True)
         destination = self._cache / f'youziauth-{version}.msi'
@@ -220,15 +231,15 @@ class UpdateController:
         self._set(total_bytes=size)
         if destination.is_file() and destination.stat().st_size == size and file_digest(destination) == digest:
             self._set(state='verifying', message='正在重新校验已下载的安装包…', downloaded_bytes=size, progress=100)
-            verify_msi(destination, self._executable, version, digest)
+            verify_msi(destination, self._executable, version, digest, signature)
         else:
-            self._download(package['browser_download_url'], size, destination, version, digest)
+            self._download(package['browser_download_url'], size, destination, version, digest, signature)
         self._ensure_open()
-        self._package = (destination, version, digest)
+        self._package = (destination, version, digest, signature)
         self._set(state='ready', progress=100, downloaded_bytes=size,
                   message=f'v{version} 已下载，哈希与发布者签名校验通过；确认后即可安装。')
 
-    def _download(self, url, size, destination, version, digest):
+    def _download(self, url, size, destination, version, digest, signature):
         self._set(state='downloading', message=f'发现 v{version}，正在后台下载安装包…')
         temporary = None
         try:
@@ -255,7 +266,7 @@ class UpdateController:
                     raise RuntimeError('安装包不完整或 SHA-256 校验失败，请重新检查以下载完整文件。')
             self._ensure_open()
             self._set(state='verifying', message='下载完成，正在校验发布者签名和安装包版本…')
-            verify_msi(temporary, self._executable, version, digest)
+            verify_msi(temporary, self._executable, version, digest, signature)
             self._ensure_open()
             temporary.replace(destination)
         finally:
@@ -263,10 +274,10 @@ class UpdateController:
                 temporary.unlink(missing_ok=True)
 
     def _install(self):
-        path, version, digest = self._package
+        path, version, digest, signature = self._package
         def launched():
             self._set(state='launched', message='Windows 安装向导已打开，请完成授权和安装；安装完成后重新打开程序。')
-        code = install_msi(path, self._executable, version, digest, launched)
+        code = install_msi(path, self._executable, version, digest, launched, signature)
         if code == 1602:
             self._set(state='ready', message='安装已取消，当前版本未更新；可以稍后再次确认安装。')
         elif code in (0, 3010):

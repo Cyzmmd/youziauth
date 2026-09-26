@@ -1,4 +1,5 @@
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -37,38 +38,68 @@ class WorkflowPolicyTests(unittest.TestCase):
                 msg=name,
             )
 
-    def test_signpath_configuration_deep_signs_both_exes_and_msi(self):
-        text = ROOT.joinpath(
-            ".signpath", "artifact-configuration.xml"
-        ).read_text(encoding="utf-8")
-        self.assertIn('<msi-file path="youziauth.msi"', text)
-        self.assertIn('<pe-file path="youziauth.exe"', text)
-        self.assertIn('<pe-file path="youziauth-agent.exe"', text)
-        self.assertEqual(text.count("<authenticode-sign"), 3)
+    def test_signpath_configuration_is_gone(self):
+        # SignPath was declined; nothing may still depend on it at release time.
+        self.assertFalse(ROOT.joinpath(".signpath").exists())
+        for name in ("ci.yml", "release.yml"):
+            text = ROOT.joinpath(".github", "workflows", name).read_text(encoding="utf-8")
+            self.assertNotIn("signpath", text.lower(), msg=name)
 
-    def test_release_requires_signpath_and_never_publishes_unsigned_msi(self):
+    def test_release_signs_with_the_pinned_key_and_never_publishes_unsigned_msi(self):
         text = ROOT.joinpath(".github", "workflows", "release.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "signpath/github-action-submit-signing-request@"
-            "b9d91eadd323de506c0c81cf0c7fe7438f3360fd",
-            text,
-        )
+        self.assertIn("tools\\sign_release.py", text)
+        self.assertIn("secrets.YOUZIAUTH_RELEASE_KEY", text)
         self.assertIn("packaging/verify_release.ps1", text)
         self.assertIn("gh release create", text)
         self.assertNotIn("dist/youziauth.msi ${{", text)
+        # The private key must never be written into the workspace or an artifact.
+        self.assertNotIn("YOUZIAUTH_RELEASE_KEY >", text)
+        self.assertNotIn("Out-File", text.split("Check release key configuration")[1].split("setup-python")[0])
+        self.assertNotIn("signpath", text.lower())
 
-    def test_release_audit_requires_valid_signatures_versions_and_hashes(self):
+    def test_signing_key_is_never_committed(self):
+        ignore = ROOT.joinpath(".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".release-key/", ignore)
+        self.assertIn("*.key", ignore)
+        # Only the public half may live in the source tree.
+        source = ROOT.joinpath("windows_update.py").read_text(encoding="utf-8")
+        self.assertIn("PUBLIC_KEY_B64", source)
+        self.assertNotIn("SECRET_KEY", source)
+
+    def test_private_key_material_is_never_tracked_by_git(self):
+        # Ask git itself: whatever it would commit must not include key material.
+        try:
+            listed = subprocess.run(
+                ["git", "ls-files"], cwd=ROOT, check=True, capture_output=True, text=True
+            ).stdout.splitlines()
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("git is unavailable")
+        for name in listed:
+            with self.subTest(tracked=name):
+                self.assertNotRegex(name.lower(), r"\.(key|pfx|p12|pem)$")
+                self.assertNotIn("release-key", name.lower())
+        # The private key must also be ignored if it exists in the checkout.
+        if (ROOT / ".release-key").exists():
+            ignored = subprocess.run(
+                ["git", "check-ignore", "-q", ".release-key/ed25519-release.key"],
+                cwd=ROOT, capture_output=True,
+            )
+            self.assertEqual(ignored.returncode, 0, "the release key must be gitignored")
+
+    def test_release_audit_requires_a_valid_signature_versions_and_hashes(self):
         text = ROOT.joinpath("packaging", "verify_release.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Get-AuthenticodeSignature", text)
-        self.assertIn("Status -ne 'Valid'", text)
+        self.assertIn("--verify-signature-file", text)
+        self.assertIn("sign_release.py", text)
         self.assertIn("msiexec.exe", text)
         self.assertIn("FileVersion", text)
         self.assertIn("SHA256SUMS.txt", text)
-        self.assertIn("release-provenance.json", text)
+        # The gate must fail closed: no Authenticode fallback, and a mismatch throws.
+        self.assertNotIn("Get-AuthenticodeSignature", text)
+        self.assertIn("throw", text)
 
 
 if __name__ == "__main__":

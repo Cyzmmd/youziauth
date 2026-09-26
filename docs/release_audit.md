@@ -1,5 +1,35 @@
 # youziauth Release Audit
 
+## 2026-09-26 Pinned-Key Update Evidence
+
+The release trust model changed: updates are now authenticated by an Ed25519 key
+compiled into the client instead of an Authenticode certificate. SignPath was not
+approved, and a certificate is no longer on the critical path. See
+[release-signing.md](release-signing.md) and [signed-release-blockers.md](signed-release-blockers.md).
+
+- Automated suite: 566 tests passed, 1 skipped (`python -m unittest discover -s tests`).
+- `ed25519.py` matches all RFC 8032 section 7.1 vectors for key derivation, signing,
+  and verification, and rejects a tampered message, a tampered signature, a
+  mismatched key, the malleable `S + L` encoding, and non-canonical points.
+- Signing the real `dist/youziauth.msi` (71,436,084 bytes) produced `SHA256SUMS.txt`,
+  `youziauth.msi.ed25519`, and `release-provenance.json`.
+  SHA-256 `b8ce52bb06cebcaf167bc93c8c54005856d4367b163e10c5cb1c7ef1ccd46d12`.
+- The published signature verifies with the public key alone; a tampered signature,
+  a wrong version, and a modified installer are all rejected.
+- `windows_update.verifier_main` accepted the genuinely signed MSI (exit 0) and
+  rejected: tampered signature, wrong version in the signed payload, another key's
+  valid signature, a downgrade to 1.6.6, and a byte-modified installer.
+- The real PowerShell worker ran against the signed MSI with only the installer
+  target redirected to a no-op. It acquired the exclusive file lock, re-computed the
+  digest, read the four MSI product properties, verified the Ed25519 signature, and
+  published `launch.json` before handing off, then reported cancel code 1602.
+  Nothing was installed.
+- The installed build and the built MSI are both 1.6.6 and still unsigned
+  (`Get-AuthenticodeSignature` → `NotSigned`), so the first pinned-key release must
+  be installed manually once.
+- Not yet done: publishing a GitHub Release with the four assets, and one full
+  in-app auto-update between two pinned-key versions.
+
 ## Cross-PC Runtime Checks
 
 - The desktop installer must not ship local `config.ini`, `campus_auth_password.txt`, or `campus_auth.log`.

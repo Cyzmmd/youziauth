@@ -17,6 +17,15 @@ build/
 dist/
 *.msi
 
+# Release signing keys and scratch work; a private signing key must never be
+# committed. Keep the offline release key outside the checkout entirely.
+.release-key/
+*.key
+.scratch/
+
+# Local research notes gathered for a decision; not part of the application.
+_csign_research/
+
 # Python caches, test output, and virtual environments
 __pycache__/
 *.py[cod]

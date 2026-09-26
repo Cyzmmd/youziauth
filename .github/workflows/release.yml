@@ -12,9 +12,18 @@ permissions:
 jobs:
   build-sign-and-release:
     runs-on: windows-latest
-    environment: signing
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - name: Check release key configuration
+        shell: powershell
+        env:
+          # Base64 of the 32-byte Ed25519 seed. The private key never enters the
+          # repository, a build product, or the logs.
+          YOUZIAUTH_RELEASE_KEY: ${{ secrets.YOUZIAUTH_RELEASE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:YOUZIAUTH_RELEASE_KEY)) {
+            throw "Missing YOUZIAUTH_RELEASE_KEY Actions secret. Add the base64 Ed25519 release seed before tagging."
+          }
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.14"
@@ -32,34 +41,31 @@ jobs:
             throw "tag/version mismatch"
           }
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build unsigned MSI
+      - name: Build MSI
         shell: powershell
         run: .\build_msi.ps1 -InstallDependencies -VerifyPayload
-      - name: Upload unsigned MSI for SignPath
-        id: upload-unsigned
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: youziauth-unsigned-${{ github.sha }}
-          path: dist/youziauth.msi
-          if-no-files-found: error
-      - name: Submit SignPath request
-        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: youziauth
-          signing-policy-slug: release-signing
-          artifact-configuration-slug: windows-msi-deep-signing
-          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: signed
-          parameters: |
-            version: "${{ env.RELEASE_VERSION }}"
+      - name: Sign MSI with the release key
+        shell: powershell
+        env:
+          YOUZIAUTH_RELEASE_KEY: ${{ secrets.YOUZIAUTH_RELEASE_KEY }}
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          python .\tools\sign_release.py --msi .\dist\youziauth.msi --version $env:RELEASE_VERSION --output-dir .\release
+          if ($LASTEXITCODE -ne 0) { throw "Signing the release failed" }
+          # The signer already refuses a key that does not match the key compiled
+          # into the client, so a misconfigured secret fails here, not for users.
+          Copy-Item .\release\youziauth.msi.ed25519 .\dist\youziauth.msi.ed25519 -Force
       - name: Verify signed release
         shell: powershell
-        run: ./packaging/verify_release.ps1 -MsiPath ./signed/youziauth.msi -Version $env:RELEASE_VERSION -OutputDirectory ./release
+        run: ./packaging/verify_release.ps1 -MsiPath ./dist/youziauth.msi -Version $env:RELEASE_VERSION -OutputDirectory ./release
       - name: Publish signed release
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME .\signed\youziauth.msi .\release\SHA256SUMS.txt .\release\release-provenance.json --verify-tag --generate-notes
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            .\dist\youziauth.msi `
+            .\release\SHA256SUMS.txt `
+            .\release\youziauth.msi.ed25519 `
+            .\release\release-provenance.json `
+            --verify-tag --generate-notes

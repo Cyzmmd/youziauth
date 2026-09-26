@@ -29,9 +29,9 @@ MSI 安装包只作为 GitHub Release 附件发布，不提交到源码仓库。
 
 - 版本号和主要变更；
 - `youziauth.msi`；
-- `SHA256SUMS.txt` 和 `release-provenance.json`；
-- 有效且带可信时间戳的 MSI Authenticode 签名；
-- MSI 内 `youziauth.exe` 与 `youziauth-agent.exe` 的有效 Authenticode 签名；
+- `SHA256SUMS.txt`、`youziauth.msi.ed25519` 和 `release-provenance.json`；
+- 发布签名的校验方法（见 [release-signing.md](release-signing.md)）；四个附件缺一不可，
+  客户端的 `app_update.RELEASE_ASSETS` 会要求它们齐全；
 - 支持的 Windows 和 Python 版本；
 - 已知限制以及“非官方项目”声明。
 
@@ -45,5 +45,6 @@ MSI 安装包只作为 GitHub Release 附件发布，不提交到源码仓库。
 6. **已确认：** `assets/` 中的图片和图标由项目作者 `yoouzic` 生成并持有版权，随项目按 GPL-3.0-only 开源发布。
 7. 发布 MSI 前核对 Python、Tcl/Tk、PyInstaller、Pillow 等随安装包分发组件的许可证，并随 Release 提供必要的第三方版权与许可证说明。
 8. 使用 `git status` 和 `git diff --cached` 人工复核首次提交的每一个文件。
-9. 确认 Git Tag 与 `VERSION` 一致，且 Release 工作流发布的是 SignPath 返回的 `signed/youziauth.msi`，不是 `dist/youziauth.msi`。
-10. 下载 Release 附件复核签名发布者、时间戳、`SHA256SUMS.txt` 和 `release-provenance.json` 后再公开推广。
+9. 确认 Git Tag 与 `VERSION` 一致，且 Release 工作流在**构建后签名、验证通过才发布**，发布的是 `dist/youziauth.msi` 以及由 `tools/sign_release.py` 生成的三个附件。
+10. 下载 Release 附件复核发布签名确实覆盖该安装包（`packaging/verify_release.ps1` 会做同样的事），并核对 `SHA256SUMS.txt` 和 `release-provenance.json` 后再公开推广。
+11. 确认私钥没有进入仓库：`git ls-files` 不应出现任何 `.key` 文件（测试会代为检查）。
