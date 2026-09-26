@@ -1,7 +1,10 @@
 param(
     [string]$PythonPath = "",
     [switch]$InstallDependencies,
-    [switch]$VerifyPayload
+    [switch]$VerifyPayload,
+    # Stop after the frozen executables pass the boot check. Iterating on the
+    # PyInstaller/Tcl/Tk layer then costs seconds instead of a full MSI build.
+    [switch]$FrozenOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -200,6 +203,11 @@ function Assert-FrozenGuiBoots {
     Write-Host "Frozen GUI boot check passed (Tcl/Tk data present, verifier dispatch reached)"
 }
 Assert-FrozenGuiBoots -AppDir $AppDir -DistDir $DistDir
+
+if ($FrozenOnly) {
+    Write-Host "Frozen-only build requested; stopping before the MSI step."
+    exit 0
+}
 
 New-Item -ItemType Directory -Force -Path $WixBuildDir | Out-Null
 $GeneratedWxs = Join-Path $WixBuildDir "ApplicationFiles.wxs"
