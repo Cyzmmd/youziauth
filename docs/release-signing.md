@@ -15,10 +15,16 @@
 | 公钥（base64） | `/sxOMzShO28Jx4h/qwna3KrN9kTqy3x6DthzsyPf1O4=` |
 | 内置于 | `windows_update.PUBLIC_KEY_B64` |
 | 私钥环境变量 | `YOUZIAUTH_RELEASE_KEY`（base64 的 32 字节种子） |
+| 私钥主位置 | `%USERPROFILE%\.youziauth-release-key\ed25519-release.key` |
+| 私钥备份 | `%LOCALAPPDATA%\youziauth-release-key-backup\ed25519-release.key` |
+| 私钥指纹 | 密钥文件 SHA-256 `E8A62C0FD7531398B1686FAF0FC431B9DBF4782642C35E1E5CB4CCF90D9A4111` |
 
-公钥编译进程序，私钥离线保存。**任何人拿到私钥都能冒充发布者，拿到公钥不能。** 私钥不得进入仓库、GitHub Secret 以外的任何位置、构建产物或日志。
+公钥编译进程序，私钥离线保存。**任何人拿到私钥都能冒充发布者，拿到公钥不能。** 私钥位于仓库之外，ACL 已设为仅当前用户可读写；不得进入仓库、构建产物或日志。
 
 > 公钥一旦随版本发布就无法更改信任关系。**轮换公钥必须发布一个新版本**，旧版本只会信任旧公钥。
+
+> 上面两个位置都在本机。真正的容灾备份需要一份**离开这台电脑**（离线介质或密码管理器），
+> 否则磁盘损坏或系统重装就等于私钥丢失。
 
 ## 签名的内容
 
@@ -76,8 +82,9 @@
 ## 签名一个版本
 
 ```powershell
-# 私钥只放在离线位置，不放进仓库
-$env:YOUZIAUTH_RELEASE_KEY = (Get-Content D:\secure\ed25519-release.key -Raw).Trim()
+# 私钥在仓库之外；不要把它复制回工作目录
+$key = Join-Path $env:USERPROFILE '.youziauth-release-key\ed25519-release.key'
+$env:YOUZIAUTH_RELEASE_KEY = (Get-Content $key -Raw).Trim()
 $version = (Get-Content VERSION -Raw).Trim()
 
 python tools\sign_release.py `
@@ -85,6 +92,8 @@ python tools\sign_release.py `
   --version $version `
   --output-dir release
 ```
+
+（正式发布不需要手工执行这段：工作流会用 Secret 自动完成。）
 
 `--version` 必须与 MSI 的 `ProductVersion` 以及 `VERSION` 三者一致，否则校验会在
 「产品属性不匹配」这一步拒绝。工作流用 `VERSION` 同时驱动构建与签名，因此不会漂移；

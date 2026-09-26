@@ -42,18 +42,24 @@
 ## 仍然需要人工做的一次性动作
 
 1. ~~配置 `YOUZIAUTH_RELEASE_KEY` Secret~~ **已完成**（2026-09-26 由 `gh secret set` 写入）。
-2. **离线备份私钥**，至少两份。丢失私钥意味着无法再发布可自动更新的版本。**这是当前唯一未完成的事项**
-   （密钥文件仍在仓库目录下，见下文）。
+2. ~~离线备份私钥~~ **已完成**（2026-09-26）：私钥已移出仓库，落在
+   `%USERPROFILE%\.youziauth-release-key\` 与 `%LOCALAPPDATA%\youziauth-release-key-backup\`，
+   两份均校验为同一 SHA-256，ACL 已收紧为仅当前用户。**建议再存一份到本机之外的介质。**
 3. **手动安装一次 `v1.6.6`**（跨过 B5）——从 Release 页面下载并按提示安装。
+   安装前可先核对：MSI 大小 52,949,816 字节，SHA-256
+   `82fddcb403518bfbe4e0d71acf2c1dc1f0b9857537b51bb3071de079f1eea6c5`。
 4. ~~递增 `VERSION`、打标签触发发布~~ **已完成**：`v1.6.6` 由
    `98e8e244107ff54e76ef1a2f47c065f14b2887e1` 构建并签出。
 
 ## 密钥与 Secret
 
 - 公钥已内置：`windows_update.PUBLIC_KEY_B64` = `/sxOMzShO28Jx4h/qwna3KrN9kTqy3x6DthzsyPf1O4=`。
-- 私钥当前存放在本机仓库目录下的 `.release-key/ed25519-release.key`（已被 `.gitignore` 忽略）。
-  该文件的 SHA-256 为 `E8A62C0FD7531398B1686FAF0FC431B9DBF4782642C35E1E5CB4CCF90D9A4111`。
-  **请把它移到仓库之外的安全位置并做离线备份，然后删除仓库目录里的副本。**
+- 私钥已在仓库之外，仓库里不再保留任何私钥材料（`.release-key/` 已删除）：
+  - 主位置：`%USERPROFILE%\.youziauth-release-key\ed25519-release.key`
+  - 备份：`%LOCALAPPDATA%\youziauth-release-key-backup\ed25519-release.key`
+  - 密钥文件 SHA-256：`E8A62C0FD7531398B1686FAF0FC431B9DBF4782642C35E1E5CB4CCF90D9A4111`
+  - 两份均只授权当前用户读写（`icacls /inheritance:r`）。
+  - **仍未做**：一份离开本机的离线备份。
 - GitHub Actions Secret `YOUZIAUTH_RELEASE_KEY` 已配置，`v1.6.6` 的签名即由它完成。
 - 签名工具会在签名前校验私钥与内置公钥是否匹配，不匹配直接失败，不会产出用户无法安装的版本。
 
