@@ -4,9 +4,30 @@
 
 ## 一句话结论
 
-**自动更新已经不再被证书阻塞。** 客户端改为内置 Ed25519 公钥、发布时用离线私钥签名安装包，因此不需要 Authenticode 证书即可完成可验证的下载→校验→安装闭环。SignPath Foundation 申请被拒只影响"首次安装的发布者身份"，不影响自动更新。
+**自动更新已经不再被证书阻塞，并且已经发出第一个可验证的正式版本 `v1.6.6`。** 客户端内置 Ed25519 公钥、发布时用离线私钥签名安装包，因此不需要 Authenticode 证书即可完成可验证的下载→校验→安装闭环。SignPath Foundation 申请被拒只影响"首次安装的发布者身份"，不影响自动更新。
 
-仍然存在的唯一硬约束：**首个 Ed25519 版本必须手动安装一次**，因为 1.6.6 及更早版本里没有新公钥，也不信任未签名安装包。
+唯一的剩余动作是一项人工操作：**手动安装一次 `v1.6.6`**。1.6.6 之前的版本里没有新公钥，也不信任未签名安装包，无法自举。
+
+## v1.6.6 发布记录（2026-09-26）
+
+- Git Tag / 提交：`v1.6.6` → `98e8e244107ff54e76ef1a2f47c065f14b2887e1`（`VERSION` = 1.6.6）。
+- 工作流 `Signed Windows release` run `36230044960` **全部步骤通过**：
+  配置检查 → 安装依赖 → 测试 → Tag/VERSION 一致 → 构建 MSI → 用发布密钥签名 → 验证签名 → 发布 Release。
+- 该 Release 同时具备 4 个资产：
+
+  | 资产 | 值 |
+  |---|---|
+  | `youziauth.msi` | 52,949,816 字节，SHA-256 `82fddcb403518bfbe4e0d71acf2c1dc1f0b9857537b51bb3071de079f1eea6c5` |
+  | `SHA256SUMS.txt` | 与上面摘要一致 |
+  | `youziauth.msi.ed25519` | `a3d1c80090a66ceeb545444653282603877f6e12657ee98e95d76c3b7d044b2d959a5f7f765d43c08e08c679bf9de185710bd632e662993ef43e9a89d9161e0e` |
+  | `release-provenance.json` | 记录提交、Tag、摘要与所用公钥 |
+
+- 下载回来的发布物已独立复核（不需要私钥）：
+  - 文件大小与 SHA-256 与 `SHA256SUMS.txt`、`release-provenance.json` 三方一致；
+  - `tools/sign_release.py --verify-signature-file` 用内置公钥验证通过；
+  - MSI 四项产品属性（ProductName / Manufacturer / ProductVersion / UpgradeCode）与预期一致；
+  - `windows_update.verifier_main` 对该发布包返回 0（接受）；
+  - 客户端自身的 `app_update.release_assets` / `read_checksum` / `read_signature` 能解析该 Release 的全部资产。
 
 ## 本轮变化
 
@@ -20,24 +41,28 @@
 
 ## 仍然需要人工做的一次性动作
 
-1. **配置 `YOUZIAUTH_RELEASE_KEY` Secret**（见下）。
-2. **离线备份私钥**，至少两份。丢失私钥意味着无法再发布可自动更新的版本。
-3. **手动安装一次首个 Ed25519 版本**（跨过 B5）。
-4. 可选：`VERSION` 递增后打标签触发发布。
+1. ~~配置 `YOUZIAUTH_RELEASE_KEY` Secret~~ **已完成**（2026-09-26 由 `gh secret set` 写入）。
+2. **离线备份私钥**，至少两份。丢失私钥意味着无法再发布可自动更新的版本。**这是当前唯一未完成的事项**
+   （密钥文件仍在仓库目录下，见下文）。
+3. **手动安装一次 `v1.6.6`**（跨过 B5）——从 Release 页面下载并按提示安装。
+4. ~~递增 `VERSION`、打标签触发发布~~ **已完成**：`v1.6.6` 由
+   `98e8e244107ff54e76ef1a2f47c065f14b2887e1` 构建并签出。
 
 ## 密钥与 Secret
 
 - 公钥已内置：`windows_update.PUBLIC_KEY_B64` = `/sxOMzShO28Jx4h/qwna3KrN9kTqy3x6DthzsyPf1O4=`。
-- 私钥当前存放在本机仓库目录下的 `.release-key/ed25519-release.key`（已被 `.gitignore` 忽略）。**发布前请把它移到仓库之外的安全位置**，仓库目录里的副本只应视为临时产物。
-- GitHub Actions Secret 名：`YOUZIAUTH_RELEASE_KEY`，内容为私钥种子的 base64（即密钥文件里那一行）。
+- 私钥当前存放在本机仓库目录下的 `.release-key/ed25519-release.key`（已被 `.gitignore` 忽略）。
+  该文件的 SHA-256 为 `E8A62C0FD7531398B1686FAF0FC431B9DBF4782642C35E1E5CB4CCF90D9A4111`。
+  **请把它移到仓库之外的安全位置并做离线备份，然后删除仓库目录里的副本。**
+- GitHub Actions Secret `YOUZIAUTH_RELEASE_KEY` 已配置，`v1.6.6` 的签名即由它完成。
 - 签名工具会在签名前校验私钥与内置公钥是否匹配，不匹配直接失败，不会产出用户无法安装的版本。
 
 ## 本机现状
 
-- 已安装版本：1.6.6，未签名（`Get-AuthenticodeSignature` → `NotSigned`）。
-- 本地构建产物：`dist/youziauth.msi`，MSI `ProductVersion` = **1.6.6**（与 `VERSION` 一致），
-  SHA-256 `b8ce52bb06cebcaf167bc93c8c54005856d4367b163e10c5cb1c7ef1ccd46d12`。
-  已用本轮密钥签名并通过验签，可作为首个 Ed25519 版本的候选。
+- 本机已安装版本仍是 1.6.6，但那是**旧的未签名构建**（`Get-AuthenticodeSignature` → `NotSigned`），
+  不含内置公钥，因此它检查更新只会得到"请使用官方安装版"的提示。需要手动安装新发布的 `v1.6.6`。
+- 旧候选产物 `dist/youziauth.msi`（71,436,084 字节）与正式 Release 的 MSI（52,949,816 字节）不同：
+  正式版由 CI 在干净环境构建，体积更小。以 Release 附件为准。
 - 寝室模块的 `location_source` 仍为 `simulation`，自动打卡窗口内提交的是已保存的示例坐标。
   要用真实定位需先切回真实来源。
 
@@ -58,18 +83,19 @@
 
 ## 补齐顺序
 
-1. 把私钥移出仓库目录并离线备份。
-2. 在 GitHub 仓库设置里添加 Actions Secret `YOUZIAUTH_RELEASE_KEY`。
-3. 递增 `VERSION`，打 `v*.*.*` 标签，确认工作流绿色且 Release 含 4 个资产。
-4. 手动安装一次该版本（跨过 B5）。
-5. 再发一个补丁版本，用应用内「检查更新」验证完整自动更新链路。
+1. **把私钥移出仓库目录并离线备份**（唯一未完成事项）。
+2. ~~配置 Actions Secret~~ 已完成。
+3. ~~递增 `VERSION` 并打标签发布~~ 已完成（`v1.6.6`）。
+4. **手动安装 `v1.6.6`**（跨过 B5）。
+5. 再发一个补丁版本，用应用内「检查更新」验证一次完整的自动更新。
 
 ## 完成判据
 
-- `python -m unittest discover -s tests` 全部通过（当前 561 项）。
-- 发布工作流绿色，Release 同时具备 `youziauth.msi`、`SHA256SUMS.txt`、`youziauth.msi.ed25519`、`release-provenance.json`。
-- `packaging/verify_release.ps1` 通过：两个 EXE 的版本元数据正确，发布签名确实覆盖安装包字节。
-- 安装首个 Ed25519 版本后，应用内「检查更新」能解析到新版本，并在应用内完成下载、校验与安装。
+- `python -m unittest discover -s tests` 全部通过（当前 566 项）。**已完成**
+- 发布工作流绿色，Release 同时具备 `youziauth.msi`、`SHA256SUMS.txt`、`youziauth.msi.ed25519`、`release-provenance.json`。**已完成**
+- `packaging/verify_release.ps1` 通过：两个 EXE 的版本元数据正确，发布签名确实覆盖安装包字节。**已完成**
+- 发布物可由客户端独立验签（大小/SHA-256/签名/产品属性四项一致，`verifier_main` 返回 0）。**已完成**
+- 安装 `v1.6.6` 后，应用内「检查更新」能解析到新版本，并在应用内完成下载、校验与安装。**待完成**（需要第 4、5 步）
 
 ## 若以后仍想解决首次安装的警告
 
