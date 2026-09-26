@@ -54,7 +54,7 @@
           <form class="paper-card form-card" id="dorm-form">
             <div class="card-label"><h3>自动打卡</h3><input id="auto-enabled" type="checkbox" role="switch" aria-label="启用自动打卡"></div>
             <p class="muted small">在你设置的时段内定期检查，保存后生效。</p>
-            <div class="time-fields"><div><label for="auto-start">开始时间</label><input id="auto-start" type="time" value="21:00" required></div><span>至</span><div><label for="auto-end">结束时间</label><input id="auto-end" type="time" value="23:30" required></div></div>
+            <div class="time-fields"><div><label for="auto-start">开始时间</label><input id="auto-start" type="time" value="21:00" required></div><span>至</span><div><label for="auto-end">结束时间</label><input id="auto-end" type="time" value="23:15" required></div></div>
             <div class="setting-row"><div><label for="auto-interval">检查间隔</label><p class="field-hint">60–3600 秒</p></div><div class="number-field"><input id="auto-interval" type="number" min="60" max="3600" value="300" required><span>秒</span></div></div>
             <p class="schedule" id="schedule">自动打卡：关闭</p>
             <div class="form-footer"><span class="form-state" id="dorm-save-state">设置已同步</span><button type="submit" class="primary">保存打卡设置</button></div>
@@ -73,6 +73,22 @@
             <p class="field-hint" id="location-mode-hint" hidden>实时位置由 Windows 决定来源，不保证只使用 Wi-Fi。如遇系统权限提示，请选择允许；已拒绝的权限需在 Windows 定位设置中开启。</p>
             <button class="secondary full" id="open-map-picker" type="button" hidden>在地图上选择位置</button>
             <button class="secondary full location-settings" data-action="location_settings">Windows 定位设置</button><button class="text-button danger" id="logout-dorm">清除学校登录凭据</button>
+          </article>
+          <article class="paper-card compact idm-credential-card">
+            <h3><i class="bi bi-shield-lock" aria-hidden="true"></i> 统一认证静默登录</h3>
+            <p class="field-hint" id="idm-credential-state">正在读取凭据状态…</p>
+            <form id="idm-credential-form" autocomplete="off">
+              <label for="idm-username">学号</label>
+              <input id="idm-username" name="idm_username" type="text" maxlength="64" autocomplete="username" placeholder="统一认证学号">
+              <label for="idm-password">密码</label>
+              <input id="idm-password" name="idm_password" type="password" maxlength="128" autocomplete="current-password" placeholder="留空则保持已保存的密码">
+              <p class="field-hint">保存后，登录时会自动点「统一认证登录」进入账号密码页，填好学号密码、识别 4 位数字验证码并提交；最多自动尝试 2 次，之后交回人工。凭据用 Windows DPAPI 加密，仅存本机当前用户；本机被完全控制时可被解密。</p>
+              <div class="form-footer">
+                <span class="form-state" id="idm-save-state"></span>
+                <button type="submit" class="primary">保存凭据</button>
+              </div>
+            </form>
+            <button class="text-button danger" id="idm-clear" type="button">清除统一认证凭据</button>
           </article></aside>
         </div>
       </section>

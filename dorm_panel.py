@@ -13,6 +13,14 @@ from dorm_checkin import CheckinError, Engine, Result, Settings, Store, now, par
 from dorm_location import locate
 from dorm_login import login
 
+# 每天最多自动续期登录几次。超过就停手，等人工登录。
+#
+# 为什么必须有这个上限：自动打卡在时段内每 interval 秒跑一次，一旦会话失效，
+# 每次都会走自动续期登录（拉起一个浏览器）。2026-09-24 实测过一次后果：
+# 21:02–23:27 连续 2.5 小时、每 5 分钟一次、成功率 0，还伴随大量 Windows 登录失败事件
+# 并导致本机账户被锁定。**自动行为必须有硬上限**，不能只靠"应该会成功"。
+MAX_DAILY_LOGIN_RENEWALS = 3
+
 
 class DormController:
     def __init__(self, store=None, engine=None):
@@ -67,12 +75,63 @@ class DormController:
         threading.Thread(target=work, name='youziauth-dorm-' + action, daemon=True).start()
         return True
 
+    def _check_window(self):
+        """返回 (start, end) 文本；读不到设置就返回 None。"""
+        try:
+            settings = self.store.settings()
+            return settings.start, settings.end
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _inside_check_window(self):
+        """当前是否在自动检查时段内。
+
+        读不到设置时返回 False —— 宁可不开浏览器，也不要在时段外自作主张。
+        """
+        window = self._check_window()
+        if window is None:
+            return False
+        start, end = window
+        try:
+            return parse_time(start) <= self.engine.clock().time() < parse_time(end)
+        except ValueError:
+            return False
+
+    def _outside_window_message(self):
+        window = self._check_window()
+        span = f'{window[0]}–{window[1]}' if window else '设定时段'
+        return (f'当前不在自动打卡时段（{span}），已停止自动登录；'
+                '请点「学校登录 / 重新登录」手动完成')
+
     def _run(self, action):
         automatic = action == 'automatic'
         result = self.engine.tick() if automatic else self.engine.run(submit=action == 'submit')
         if result is None or result.state != 'login_required' or time.monotonic() < self._renew_at:
             return result
         self._renew_at = time.monotonic() + 300
+        # 只在检查时段内自动登录：用户要求「每天晚上 21 点才开始尝试自动登录」。
+        #
+        # 为什么需要这道闸：自动打卡在时段外会被 Engine 直接判为 waiting（不碰网络），
+        # 但**人工**在白天点一次「查询今日任务」也会得到 login_required，
+        # 而那同样会走到下面这段续期登录、在无人值守的情况下拉起一个浏览器。
+        # 时段外一律不偷偷开浏览器，直接告诉人手动登录。
+        if not self._inside_check_window():
+            return Result('login_required', self._outside_window_message())
+        # 熔断：每天自动续期登录有硬上限。到顶就不再拉起浏览器，直接告诉人去手动登录。
+        # 只对自动打卡生效 —— 人工点「登录 / 重新登录」永远不受限制。
+        today = self.engine.clock().date().isoformat()
+        try:
+            used = self.store.daily_attempts(today, 'login_renewal')
+        except Exception:  # noqa: BLE001
+            used = 0
+        if automatic and used >= MAX_DAILY_LOGIN_RENEWALS:
+            return Result('login_required',
+                          f'今天已自动尝试登录 {used} 次仍未成功，已停止自动重试；'
+                          '请点「学校登录 / 重新登录」手动完成，或检查已保存的凭据')
+        try:
+            self.store.bump_daily_attempts(today, 'login_renewal')
+        except Exception:  # noqa: BLE001
+            pass                      # 记不上也照常尝试，只是上限保护会失效一次
         try:
             login(self.store, self.api, self.engine.cancel, interactive=False)
         except CheckinError as exc:
@@ -178,11 +237,32 @@ class DormPanel:
         self.buttons.append(logout)
         ttk.Button(actions, text='Windows 定位设置', command=self.open_location_settings).grid(row=1, column=2, pady=4)
 
+        # 统一认证（IDM）凭据：用于自动填写账号密码 + 自动识别验证码。
+        # 不填也能用，只是每次登录都需要人工输入。
+        self.idm_box = ttk.LabelFrame(frame, text='统一认证静默登录（可选）', padding=12)
+        self.idm_box.grid(row=6, sticky='ew', pady=(12, 0))
+        self.idm_status = tk.StringVar()
+        ttk.Label(self.idm_box, textvariable=self.idm_status, wraplength=620,
+                  justify='left').grid(row=0, column=0, columnspan=4, sticky='w')
+        ttk.Label(self.idm_box, text='说明：凭据用 Windows DPAPI 加密后仅存本机，'
+                                     '仅供自动登录使用；可在本机被完全控制时被解密。',
+                  wraplength=620, justify='left').grid(row=1, column=0, columnspan=4, sticky='w', pady=(4, 8))
+        ttk.Label(self.idm_box, text='学号').grid(row=2, column=0, sticky='w')
+        self.idm_user = tk.StringVar()
+        ttk.Entry(self.idm_box, width=22, textvariable=self.idm_user).grid(row=2, column=1, padx=5, sticky='w')
+        ttk.Label(self.idm_box, text='密码').grid(row=2, column=2, sticky='w')
+        self.idm_pass = tk.StringVar()
+        ttk.Entry(self.idm_box, width=22, textvariable=self.idm_pass, show='•').grid(row=2, column=3, padx=5, sticky='w')
+        ttk.Button(self.idm_box, text='保存凭据', command=self.save_idm_credentials).grid(row=3, column=1, pady=6, sticky='w')
+        self.idm_clear = ttk.Button(self.idm_box, text='清除凭据', command=self.clear_idm_credentials)
+        self.idm_clear.grid(row=3, column=3, pady=6, sticky='w')
+        self.buttons.append(self.idm_clear)
+
         options = ttk.LabelFrame(frame, text='自动打卡', padding=12)
-        options.grid(row=6, sticky='ew', pady=12)
+        options.grid(row=7, sticky='ew', pady=12)
         self.enabled = tk.BooleanVar(value=False)
         self.start = tk.StringVar(value='21:00')
-        self.end = tk.StringVar(value='23:30')
+        self.end = tk.StringVar(value='23:15')
         self.interval = tk.StringVar(value='300')
         ttk.Checkbutton(options, text='启用自动打卡（保存后生效）', variable=self.enabled).grid(row=0, column=0, columnspan=4, sticky='w')
         ttk.Label(options, text='检查时段').grid(row=1, column=0, sticky='w', pady=8)
@@ -194,12 +274,13 @@ class DormPanel:
         ttk.Button(options, text='保存打卡设置', command=self.save).grid(row=2, column=3, padx=5)
         self.location_text = tk.StringVar()
         ttk.Label(frame, textvariable=self.location_text,
-                  wraplength=620, justify='left').grid(row=7, sticky='w', pady=(0, 10))
+                  wraplength=620, justify='left').grid(row=8, sticky='w', pady=(0, 10))
         self.history = tk.Text(frame, height=7, wrap='word', state='disabled', font=('Microsoft YaHei UI', 9))
-        self.history.grid(row=8, sticky='nsew')
-        frame.rowconfigure(8, weight=1)
+        self.history.grid(row=9, sticky='nsew')
+        frame.rowconfigure(9, weight=1)
         self._history_text = None
         self.load_settings()
+        self.refresh_idm_status()
         self.refresh()
 
     def show(self):
@@ -234,6 +315,60 @@ class DormPanel:
         except RuntimeError as exc:
             messagebox.showerror('无法保存', str(exc), parent=self.window)
         self.refresh()
+
+    def refresh_idm_status(self):
+        """显示统一认证凭据的存储状态（不显示密码本身）。"""
+        try:
+            from idm_credentials import IdmCredentialStore
+            store = IdmCredentialStore()
+            if not store.exists():
+                self.idm_status.set('未保存统一认证凭据：每次登录需人工输入账号密码和验证码。')
+                self.idm_clear.state(['disabled'])
+                return
+            creds = store.load()
+            name = creds.username if creds else ''
+            self.idm_status.set(f'已保存统一认证凭据（学号 {name}）：登录时将自动填写并识别验证码。')
+            if creds:
+                self.idm_user.set(creds.username)
+            self.idm_clear.state(['!disabled'])
+        except Exception as exc:  # noqa: BLE001
+            self.idm_status.set(f'统一认证凭据状态未知：{exc}')
+            self.idm_clear.state(['disabled'])
+
+    def save_idm_credentials(self):
+        from tkinter import messagebox
+        try:
+            from idm_credentials import IdmCredentialStore, IdmCredentials
+            creds = IdmCredentials(username=self.idm_user.get().strip(),
+                                   password=self.idm_pass.get()).validate()
+            IdmCredentialStore().save(creds)
+        except ValueError as exc:
+            messagebox.showerror('无法保存', str(exc), parent=self.window)
+            return
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror('无法保存', f'凭据加密保存失败：{exc}', parent=self.window)
+            return
+        # 保存成功后立刻清空密码输入框，避免明文长期停留在界面变量中
+        self.idm_pass.set('')
+        self.refresh_idm_status()
+        self.state.set('统一认证凭据已加密保存，可用于自动登录')
+
+    def clear_idm_credentials(self):
+        from tkinter import messagebox
+        if not messagebox.askyesno('清除凭据',
+                                   '确定清除已保存的统一认证凭据？\n清除后登录需要人工输入账号密码和验证码。',
+                                   parent=self.window):
+            return
+        try:
+            from idm_credentials import IdmCredentialStore
+            IdmCredentialStore().clear()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror('无法清除', str(exc), parent=self.window)
+            return
+        self.idm_user.set('')
+        self.idm_pass.set('')
+        self.refresh_idm_status()
+        self.state.set('统一认证凭据已清除')
 
     def act(self, action):
         if self.controller.start(action):

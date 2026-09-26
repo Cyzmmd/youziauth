@@ -47,7 +47,7 @@ def parse_time(value: str) -> dt.time:
 class Settings:
     enabled: bool = False
     start: str = '21:00'
-    end: str = '23:30'
+    end: str = '23:15'
     interval: int = 300
     location_source: str = 'windows'
 
@@ -122,7 +122,15 @@ class Store:
 
     def _read(self, name, default):
         try:
-            return json.loads((self.root / name).read_text(encoding='utf-8'))
+            # utf-8-sig：容忍别人（记事本 / PowerShell 的 -Encoding utf8）写进来的 BOM。
+            # 实测教训：一个 BOM 会让 json.loads 抛 JSONDecodeError，而它不被下面的
+            # FileNotFoundError 捕获，异常一路冒到界面同步循环，整个面板显示
+            # 「界面暂时无法连接后台」—— 见 test_dorm_settings_robustness.py。
+            #
+            # 注意这里**只**容忍 BOM，不容忍真正损坏的 JSON：
+            # 配置读不动必须继续 fail-closed 并显式报错（见 test_corrupt_settings_fail_closed），
+            # 绝不能静默降级成默认值——那等于悄悄关掉自动打卡而不告诉用户。
+            return json.loads((self.root / name).read_text(encoding='utf-8-sig'))
         except FileNotFoundError:
             return default
 
@@ -178,6 +186,55 @@ class Store:
         if token:
             self.save_token(token)
 
+    def signed_record(self):
+        """已被服务器确认完成打卡的那一天（返回 {'date','student'}，没有则空 dict）。
+
+        用途：用户要求「一天成功过一次，后续就不用再判定」，见 Engine._already_signed_today。
+        """
+        value = self._read('signed.json', {})
+        return value if isinstance(value, dict) else {}
+
+    def mark_signed(self, date, student=''):
+        """记录「这一天已确认完成打卡」。
+
+        不会用空学号覆盖已有的完整记录：免重复判定走的是缓存路径（拿不到 task），
+        若无条件覆盖会把学号抹掉，学号保护也就失效了。
+        """
+        if not isinstance(date, str) or not date:
+            return
+        current = self.signed_record()
+        if current.get('date') == date and current.get('student') and not student:
+            return
+        self._write('signed.json', {'date': date, 'student': student or ''})
+
+    def daily_attempts(self, date, name):
+        """取「某天某个计数器的值」，用于给自动行为设每天的次数上限。"""
+        value = self._read('daily.json', {})
+        if not isinstance(value, dict):
+            return 0
+        bucket = value.get(date)
+        if not isinstance(bucket, dict):
+            return 0
+        count = bucket.get(name)
+        return count if isinstance(count, int) and count >= 0 else 0
+
+    def bump_daily_attempts(self, date, name):
+        """把某天某个计数器 +1 并返回新值。
+
+        只保留 date 当天及更晚的桶，避免文件无界增长。
+        """
+        value = self._read('daily.json', {})
+        if not isinstance(value, dict):
+            value = {}
+        bucket = value.get(date)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket[name] = self.daily_attempts(date, name) + 1
+        keep = {key: item for key, item in value.items() if isinstance(key, str) and key >= date}
+        keep[date] = bucket
+        self._write('daily.json', keep)
+        return bucket[name]
+
     def _pending_keys(self):
         value = self._read('pending.json', [])
         if isinstance(value, str):
@@ -232,7 +289,9 @@ class Store:
 
     def history(self):
         try:
-            return (self.root / 'history.log').read_text(encoding='utf-8')
+            # utf-8-sig：与 _read 同理，容忍外部工具写入的 BOM
+            # （BOM 会让第一行带上 \ufeff，虽不影响阅读，但读取失败会连累整个快照）。
+            return (self.root / 'history.log').read_text(encoding='utf-8-sig')
         except FileNotFoundError:
             return ''
 
@@ -298,6 +357,15 @@ class Engine:
                 return Result('disabled', '自动打卡未启用')
             if automatic and not parse_time(settings.start) <= current.time() < parse_time(settings.end):
                 return Result('waiting', f'等待检查时段 {settings.start}–{settings.end}')
+            # ★ 当天已确认完成 → 当天不再判定（用户要求：一天成功过一次，后续不用再判）。
+            #
+            # 位置很关键：必须在**任何网络调用之前**。这样打卡成功的当天既不再打学校接口，
+            # 也不会因为会话过期而走自动续期登录 —— 那正是之前每 5 分钟无人值守拉起一次
+            # 浏览器、连续数小时、成功率为 0 的那个循环。
+            #
+            # 只作用于自动检查：人工「查询今日任务」仍然真实查询，方便随时核实。
+            if automatic and self._already_signed_today(current):
+                return self._result('signed', '今日打卡已完成，当天不再重复检查')
             token = self.store.token()
             if not token:
                 return self._result('login_required', '请先登录统一身份认证')
@@ -425,9 +493,48 @@ class Engine:
 
     def _result(self, state, message, task=None):
         result = Result(state, message, task, self.clock().isoformat(timespec='seconds'))
+        if state == 'signed':
+            self._mark_signed(task)
         try:
             self.store.record(result)
         except OSError:
             if state != 'signed':
                 return Result('error', '无法写入打卡状态，请检查本地目录权限', task)
         return result
+
+    def _mark_signed(self, task):
+        """记下「今天已完成」，供当天后续的自动检查免重复判定。
+
+        放在 _result 这个**唯一出口**上，保证任何产生 signed 的路径（直接判定、
+        提交成功后、以及 readback 回查确认）都不会漏记。
+        记录失败不影响本次结果：最坏情况只是后续仍会照常查询。
+        """
+        try:
+            date = task.date if task is not None else self.clock().date().isoformat()
+            student = task.student if task is not None else ''
+            self.store.mark_signed(date, student)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _already_signed_today(self, current):
+        """今天是否已被服务器确认完成过打卡。
+
+        学号保护：记录里的学号与会话绑定的学号若都能取到且**不一致**，就不走捷径 ——
+        同一台机器换账号后，不能把上一个账号的「今天已完成」误判成本账号的。
+        任一侧取不到时无法证伪，沿用记录（宁可少查一次，也不重复打扰学校接口）。
+        """
+        try:
+            record = self.store.signed_record()
+        except Exception:  # noqa: BLE001
+            return False
+        if record.get('date') != current.date().isoformat():
+            return False
+        recorded = record.get('student') or ''
+        if not recorded:
+            return True
+        try:
+            session = self.store.browser_session(self.store.token())
+        except Exception:  # noqa: BLE001
+            return True
+        bound = (session or {}).get('student') or ''
+        return not bound or bound == recorded

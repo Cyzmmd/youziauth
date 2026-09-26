@@ -16,7 +16,7 @@ def run(output, online_login=False):
         from dorm_checkin import Store
         from dorm_panel import DormController, DormPanel
         from playwright.sync_api import sync_playwright
-        from dorm_login import owned_browser, open_login_page
+        from dorm_login import enter_idm_login, owned_browser, open_login_page
         with tempfile.TemporaryDirectory(prefix='youziauth-selftest-') as directory:
             store = Store(Path(directory))
             store.save_token('offline-selftest-only')
@@ -39,9 +39,42 @@ def run(output, online_login=False):
                         result['scope'] = 'school login page navigation only; no credentials or submission'
                         page = context.pages[0]
                         open_login_page(page, threading.Event())
-                        page.locator('#loginName').wait_for(state='visible', timeout=10000)
-                        page.locator('#password').wait_for(state='visible', timeout=10000)
+                        # open_login_page 只到 CAS「推荐登录」选择页；
+                        # 账号密码表单在 idm.swu.edu.cn，必须再点「统一认证登录」
+                        # 才出现 #loginName（按钮文字画在图里，只能用 onclick 定位）。
+                        enter_idm_login(page, threading.Event())
+                        page.locator('#loginName').wait_for(state='visible', timeout=15000)
+                        page.locator('#password').wait_for(state='visible', timeout=15000)
                         result['school_login_page'] = True
+                        captcha = page.locator('#kaptchaImage')
+                        captcha.wait_for(state='visible', timeout=15000)
+                        result['captcha_image'] = bool(captcha.evaluate('e => e.naturalWidth > 0'))
+                        try:
+                            from captcha_ocr import CaptchaSolver  # noqa: PLC0415
+
+                            code, confidence = CaptchaSolver().read(captcha.screenshot())
+                            result['captcha_model'] = {'digits': len(code), 'confidence': round(confidence, 4)}
+                        except Exception as exc:  # noqa: BLE001
+                            result['captcha_model'] = {'error': type(exc).__name__ + ': ' + str(exc)[:120]}
+                        # 纯 HTTP 客户端自检：登录提交走的是它（浏览器 POST 会被站点
+                        # WAF 拦成 400 空白页，见 idm_http.py）。这里只**取一张验证码**，
+                        # 不提交任何凭据，用于证明冻结环境里 urllib/TLS/模型这条链路可用。
+                        try:
+                            import idm_http  # noqa: PLC0415
+
+                            info = idm_http.export_login_form(page)
+                            cookies = idm_http.browser_cookies(context)
+                            client = idm_http.HttpClient(
+                                cookies, referer=(info or {}).get('pageurl') or idm_http.IDM_LOGIN_URL)
+                            status, _headers, body = client.request(
+                                'GET', idm_http.IDM_CAPTCHA_URL, accept='image/*,*/*;q=0.8', timeout=25)
+                            result['http_client'] = {
+                                'status': status, 'bytes': len(body),
+                                'form_fields': len((info or {}).get('fields') or {}),
+                                'cookies': len(cookies),
+                            }
+                        except Exception as exc:  # noqa: BLE001
+                            result['http_client'] = {'error': type(exc).__name__ + ': ' + str(exc)[:160]}
                     context.route('**/*', lambda route: route.abort())
                     page = context.new_page()
                     page.set_content('<title>youziauth offline self-test</title><p>Ready</p>')

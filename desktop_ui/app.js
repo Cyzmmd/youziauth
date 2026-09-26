@@ -104,6 +104,12 @@ function render() {
   $('submit-dorm').firstChild.textContent=d.state==='uncertain'?'回查提交结果 ':'提交今日打卡 ';
   $('cancel-dorm').disabled=pending||!d.busy;
   $('logout-dorm').disabled=pending||d.busy;
+  $('idm-credential-state').textContent=d.has_idm_credentials
+    ?`已保存统一认证凭据（学号 ${d.idm_username||'未知'}）：登录时会自动填写并识别验证码。`
+    :'未保存统一认证凭据：每次登录需人工输入账号密码和验证码。';
+  $('idm-clear').disabled=!d.has_idm_credentials||pending||d.busy;
+  $('idm-username').disabled=pending||d.busy;
+  $('idm-password').disabled=pending||d.busy;
   if(!simulation&&mapState)closeMap();
   $('open-map-picker').hidden=!simulation||!!mapState;
   document.querySelectorAll('button[type="submit"]').forEach(b=>b.disabled=pending||(b.closest('form').id==='dorm-form'&&d.busy));
@@ -213,6 +219,22 @@ $('save-location-source').addEventListener('click',async()=>{
     render();
   }
 });
+$('idm-credential-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  if(!state||syncedEpoch!==epoch){notify('凭据状态尚未同步，请稍后重试。',true);return;}
+  const username=$('idm-username').value.trim();
+  const password=$('idm-password').value;
+  if(!username){notify('请填写统一认证学号。',true);return;}
+  if(!password&&!state.dorm.has_idm_credentials){notify('首次保存需要填写密码。',true);return;}
+  if(await act('idm_credentials_save',{idm_username:username,idm_password:password})){
+    $('idm-password').value='';
+    $('idm-save-state').textContent='已保存';
+    render();
+  }
+});
+$('idm-clear').onclick=()=>confirmAction('清除统一认证凭据？',
+  '清除后登录需要人工输入账号密码和验证码。校园网账号与打卡登录态不受影响。',
+  async()=>{if(await act('idm_credentials_clear')){$('idm-password').value='';$('idm-save-state').textContent='';render();}});
 $('toggle-password').addEventListener('click',()=>{const show=$('password').type==='password';$('password').type=show?'text':'password';$('toggle-password').setAttribute('aria-label',show?'隐藏密码':'显示密码');$('toggle-password').setAttribute('aria-pressed',String(show));});
 let confirmation=null,previousFocus=null;
 function confirmAction(title,text,action){previousFocus=document.activeElement;$('confirm-title').textContent=title;$('confirm-text').textContent=text;confirmation=action;$('confirm-dialog').showModal();$('confirm-cancel').focus();}

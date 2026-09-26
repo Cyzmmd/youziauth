@@ -208,17 +208,55 @@ class DesktopBridge(LocationProbe):
         except RuntimeError:
             pass
 
+    @staticmethod
+    def _idm_credential_status():
+        """统一认证凭据状态：仅返回「是否已保存」与学号，绝不回传密码。
+
+        任何异常都降级为「未保存」——凭据读取失败不应让整个界面快照出错。
+        """
+        try:
+            from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+
+            store = IdmCredentialStore()
+            if not store.exists():
+                return {'has_idm_credentials': False, 'idm_username': ''}
+            creds = store.load()
+            return {'has_idm_credentials': True,
+                    'idm_username': (creds.username if creds else '')}
+        except Exception:  # noqa: BLE001
+            return {'has_idm_credentials': False, 'idm_username': ''}
+
     def snapshot(self):
         """Read only. Never expose passwords, tokens, coordinates or raw school payloads."""
         with self._lock:
             settings = gui.load_gui_settings(self._config)
-            ds = self._dorm.store.settings()
+            # 边界隔离：某个设置文件读不动时，只降级「寝室打卡」区块，
+            # **绝不让整个快照失败**。否则前端 refresh() 的 catch 会显示
+            # 「界面暂时无法连接后台」，把「一个设置文件坏了」误报成「后台连不上」，
+            # 让人完全找不到方向（实测踩过：一个 BOM 就让整个面板断连）。
+            # 注意这不改变 fail-closed 语义：Engine 仍会因读不动配置而拒绝执行。
+            settings_error = ''
+            try:
+                ds = self._dorm.store.settings()
+                location_source = ds.location_source
+                dorm_settings = dataclasses.asdict(ds)
+                schedule = self._dorm.schedule_text()
+            except Exception:  # noqa: BLE001
+                fallback = Settings()
+                location_source = fallback.location_source
+                dorm_settings = dataclasses.asdict(fallback)
+                schedule = '打卡设置无法读取，请打开寝室打卡设置重新保存'
+                settings_error = schedule
             result = self._dorm.latest
             task = result.task
+            try:
+                dorm_log = self._dorm.store.history()
+            except Exception:  # noqa: BLE001
+                dorm_log = ''
             return {
                 'preview': False,
                 'update': self._updates.snapshot(),
-                'location': self._location_snapshot(ds.location_source),
+                'location': self._location_snapshot(location_source),
                 'network': {
                     'username': '' if settings.username == 'YOUR_STUDENT_ID' else settings.username,
                     'interval': settings.check_interval_seconds, 'startup': self._agent,
@@ -228,15 +266,17 @@ class DesktopBridge(LocationProbe):
                     'has_password': (self._config.parent / 'credential.dat').exists(),
                 },
                 'dorm': {
-                    'state': result.state, 'message': result.message,
-                    'busy': self._dorm.busy, 'settings': dataclasses.asdict(ds),
-                    'schedule': self._dorm.schedule_text(),
+                    'state': result.state, 'message': settings_error or result.message,
+                    'busy': self._dorm.busy, 'settings': dorm_settings,
+                    'schedule': schedule,
                     'task': ({k: getattr(task, k) for k in
                               ('title', 'date', 'start', 'end', 'address', 'signed')} if task else None),
+                    # 只暴露「是否已保存」与学号，绝不回传密码
+                    **self._idm_credential_status(),
                 },
                 'logs': {
                     'network': gui.tail_log(gui.resolve_log_path(self._config, settings.log_file)),
-                    'dorm': self._dorm.store.history(),
+                    'dorm': dorm_log,
                 },
             }
 
@@ -336,6 +376,24 @@ class DesktopBridge(LocationProbe):
         if action == 'location_settings':
             os.startfile('ms-settings:privacy-location')
             return '已打开 Windows 定位设置'
+        if action == 'idm_credentials_save':
+            username = str(payload.get('idm_username') or '').strip()
+            password = str(payload.get('idm_password') or '')
+            try:
+                from idm_credentials import IdmCredentialStore, IdmCredentials  # noqa: PLC0415
+
+                IdmCredentialStore().save(IdmCredentials(username=username, password=password).validate())
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from None
+            return '统一认证凭据已加密保存，登录时将自动填写并识别验证码'
+        if action == 'idm_credentials_clear':
+            try:
+                from idm_credentials import IdmCredentialStore  # noqa: PLC0415
+
+                IdmCredentialStore().clear()
+            except Exception:  # noqa: BLE001
+                raise RuntimeError('统一认证凭据清除失败，请检查本机权限后重试') from None
+            return '统一认证凭据已清除，登录将需要人工输入账号密码和验证码'
         if action in ('hide', 'quit'):
             self._window_action(action)
             return '已隐藏到托盘' if action == 'hide' else '正在退出'

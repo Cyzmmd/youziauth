@@ -13,6 +13,10 @@ datas = [
     (str(ROOT / "desktop_ui"), "desktop_ui"),
     (str(ROOT / "THIRD_PARTY_NOTICES.md"), "."),
     (str(ROOT / "third_party_licenses"), "third_party_licenses"),
+    # 统一认证验证码识别模型（约 578 KB）。
+    # 仅 GUI 应用需要：后台 agent 只做校园网 ePortal 认证，不涉及验证码，
+    # 因此不把模型与 numpy 打进 youziauth-agent，避免让常驻进程变重。
+    (str(ROOT / "data" / "captcha" / "model.npz"), "data/captcha"),
 ]
 
 gui_analysis = Analysis(
@@ -22,7 +26,12 @@ gui_analysis = Analysis(
     datas=datas,
     hiddenimports=["playwright.sync_api", "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
                    "winrt.runtime", "winrt.windows.foundation", "winrt.windows.devices.geolocation",
-                   "winrt._winrt", "winrt._winrt_windows_foundation", "winrt._winrt_windows_devices_geolocation"],
+                   "winrt._winrt", "winrt._winrt_windows_foundation", "winrt._winrt_windows_devices_geolocation",
+                   # 验证码识别相关的延迟导入：captcha_ocr 只在真正需要识别时才 import，
+                   # 静态分析可能漏掉，显式声明以保证打进包里。
+                   # idm_http 是纯 HTTP 提交登录（绕开站点 WAF 对浏览器 POST 的拦截），
+                   # 由 idm_login 在函数内 import，同样需要显式声明。
+                   "captcha_ocr", "idm_login", "idm_http", "idm_credentials"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -161,6 +161,10 @@ class GlobalLocationTests(unittest.TestCase):
         with patch('dorm_location.read_position', return_value=raw):
             self.assertEqual(self.controller.engine.run(submit=True).state, 'signed')
         self.assertEqual(self.api.submit.call_args.args[2]['provider'], 'windows')
+        # 新规则：当天一旦确认完成，自动检查当天就不再判定（见 Engine._already_signed_today）。
+        # 本用例要验证的是「定位来源同样作用于自动检查」，所以先清掉当天已完成记录，
+        # 否则 tick() 会正确地短路掉，测不到自动分支。
+        (self.store.root / 'signed.json').unlink(missing_ok=True)
         self.controller.save(Settings(enabled=True, location_source='simulation'))
         with patch('dorm_location.read_position', side_effect=AssertionError('Simulation must not locate')):
             self.assertEqual(self.controller.engine.tick().state, 'signed')

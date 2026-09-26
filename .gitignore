@@ -26,6 +26,12 @@ dist/
 # Local research notes gathered for a decision; not part of the application.
 _csign_research/
 
+# Captcha model training artifacts. The shipped inference model is
+# data/captcha/model.npz and IS committed (the build bundles it); everything else
+# under data/captcha is local training/labelling output, not part of the app.
+data/captcha/*
+!data/captcha/model.npz
+
 # Python caches, test output, and virtual environments
 __pycache__/
 *.py[cod]
