@@ -256,6 +256,15 @@ def owned_browser(playwright, cancel, *, headless=False):
                     pass
                 cancel.wait(.1)
             browser = playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=10000)
+            if headless:
+                # ★ 不伪装必被站点一眼认出（实测：headless 下 UA 含 HeadlessChrome、
+                #   屏幕 800x600，uaaap CAS 那一跳直接 400 → 无人值守续期必失败）。
+                try:
+                    for context in browser.contexts:
+                        for page in context.pages:
+                            disguise_headless(page)
+                except Exception:  # noqa: BLE001
+                    pass          # 伪装失败只是回到「可能被拦」，不能让登录失败
             yield browser
         finally:
             if browser is not None:
@@ -270,6 +279,41 @@ def owned_browser(playwright, cancel, *, headless=False):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+
+
+def disguise_headless(page):
+    """把 headless 的指纹伪装成普通桌面 Chrome；返回是否真的改过。
+
+    ★ 为什么必须有它（2026-09-26 晚实机根因）
+    -----------------------------------------
+    无人值守续期走的是 `headless=True`，而 headless 的指纹一眼就能认出来：
+    UA 里写着 `HeadlessChrome/153.0.0.0`、`screen` 是 800x600。站点动态防护据此
+    把 `uaaap.swu.edu.cn/cas/login` 那一跳判成 **HTTP 400** —— 于是
+    `enter_idm_login` 失败、进不了 IDM 表单页，续期三次全败（history.log 里
+    「联邦认证中转页返回 HTTP 400」「学校登录交换未完成」）；而**手动登录**
+    （`interactive=True` → 有头）同一链路逐跳正常，所以「手动能用、无人值守不行」。
+
+    实测（tools/probe_headless_parity.py、tools/probe_headless_disguise.py）：
+      * headless 原始：…302/302/200/**400** → 停在 uaaap CAS 页，进不了表单页；
+      * 有头：…302/302/200/302/302/307/200 → **IDM 表单页**，取验证码 200；
+      * 伪装后 headless：与有头**逐跳一致**，取验证码 200、模型识别 0.9998。
+
+    任何异常都返回 False：伪装失败只是回到「可能被拦」，绝不能让登录本身失败。
+    """
+    try:
+        original = page.evaluate('() => navigator.userAgent')
+        if not isinstance(original, str) or 'HeadlessChrome' not in original:
+            return False                      # 不是 headless（或已伪装过）
+        session = page.context.new_cdp_session(page)
+        session.send('Network.setUserAgentOverride', {
+            'userAgent': original.replace('HeadlessChrome/', 'Chrome/'),
+            'acceptLanguage': 'zh-CN,zh'})
+        session.send('Emulation.setDeviceMetricsOverride', {
+            'width': 1280, 'height': 800, 'deviceScaleFactor': 1, 'mobile': False,
+            'screenWidth': 1536, 'screenHeight': 864})
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_token_exchange(value):
@@ -510,6 +554,9 @@ def login(store, api, cancel, timeout=300, *, interactive=True, idm_credentials=
             context.on('response', capture)
             page = context.pages[0] if context.pages else context.new_page()
             log = attempt_log(store)
+            if not interactive:
+                log('无人值守：headless 会话已按普通 Chrome 伪装（UA/视口/屏幕），'
+                    '否则站点会把 uaaap CAS 那一跳判成 400（实测根因）')
             credentials = resolve_idm_credentials(idm_credentials)
             silent_result = None
             open_login_page(page, cancel, authenticated=lambda: bool(token))

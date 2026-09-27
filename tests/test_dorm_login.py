@@ -610,6 +610,44 @@ class SessionLoginTests(unittest.TestCase):
                       'https://of.swu.edu.cn/gateway/auth/exchange-token'):
             self.assertFalse(dorm_login.is_authorize_hop(value), value)
 
+    def test_headless_disguise_swaps_ua_and_viewport(self):
+        """★ 无人值守（headless）必须伪装成普通 Chrome。
+
+        实测根因（2026-09-26 晚）：headless 的 UA 含 `HeadlessChrome/153.0.0.0`、
+        屏幕 800x600 → `uaaap/cas/login` 那一跳被判 **400**，进不了 IDM 表单页，
+        续期三次全败；有头（手动登录）同一链路逐跳正常。
+        """
+        page = Mock()
+        page.evaluate.return_value = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                      '(KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36')
+        session = page.context.new_cdp_session.return_value
+        self.assertTrue(dorm_login.disguise_headless(page))
+        sent = {call.args[0]: call.args[1] for call in session.send.call_args_list}
+        ua = sent['Network.setUserAgentOverride']['userAgent']
+        self.assertNotIn('HeadlessChrome', ua)
+        self.assertIn('Chrome/153.0.0.0', ua)
+        self.assertEqual(sent['Emulation.setDeviceMetricsOverride']['screenWidth'], 1536)
+        self.assertEqual(sent['Emulation.setDeviceMetricsOverride']['width'], 1280)
+
+    def test_headful_page_is_left_alone(self):
+        page = Mock()
+        page.evaluate.return_value = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                                      '(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36')
+        self.assertFalse(dorm_login.disguise_headless(page))
+        page.context.new_cdp_session.assert_not_called()
+
+    def test_disguise_failure_never_breaks_the_login(self):
+        closed = Mock()
+        closed.evaluate.side_effect = RuntimeError('page closed')
+        self.assertFalse(dorm_login.disguise_headless(closed))
+        no_cdp = Mock()
+        no_cdp.evaluate.return_value = 'HeadlessChrome/1'
+        no_cdp.context.new_cdp_session.side_effect = RuntimeError('cdp gone')
+        self.assertFalse(dorm_login.disguise_headless(no_cdp))
+        weird = Mock()
+        weird.evaluate.return_value = Mock()          # 读不到字符串也不能炸
+        self.assertFalse(dorm_login.disguise_headless(weird))
+
     def test_adopting_a_session_replaces_browser_cookies_instead_of_duplicating(self):
         """★ 灌会话前必须先清：同名两代 cookie 并存会让授权跳转被判重放（400）。
 

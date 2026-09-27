@@ -93,16 +93,66 @@
 **本轮全量测试**：`python -m unittest discover -s tests -q` → **542 passed, 1 skipped**
 （既有 `test_windows_update` 在全量跑里偶发失败一次：`test_worker_rejects_invalid_signature_result_and_timestamp`
 的某个 subTest 报了另一个错误文案。事后单独跑 10 遍、全量跑 3 遍（含构建高负载）均通过，
-未能复现，暂记为**低频偶发**、与本轮改动无关 —— 复现时先看它的 worker 退出码与 `_ERRORS` 映射。）
+未能复现，暂记为**低频偶发**、与本轮改动无关 —— 复现时先看它的 worker 退出码与 `_ERRORS` 映射。
+注：该文件在当天 16:08 被发布/签名那条工作流更新过，**新版全绿**。）
 
-**构建与打包验证**（VERSION 已 bump 到 1.6.6）：
-- `.\build_msi.ps1 -InstallDependencies -VerifyPayload` → 成功；
+### 1.6.6 续修②（当晚 21:01–22:42）：无人值守失败 = **headless 被站点识别**
+
+**现象**（用户报告「手动全通、无人值守失败」）：`daily.json` 记到 `login_renewal: 3`（当天熔断用满），
+三次续期全败，而同一晚手动点「学校登录」（有头）两次都一次通过：
+
+```
+21:01:45 旧会话未接上：清空学校 cookie，改用干净会话重走链路
+21:01:46 [network_error] 联邦认证中转页返回 HTTP 400，请稍后重试或手动登录
+21:07:01 静默登录未通过：reason=not_on_idm_form（进不了 IDM 表单页）
+21:12:04 同上；随后每次自动检查只报 login_required（熔断生效）
+```
+
+**根因**：`interactive=False` → `owned_browser(headless=True)`，而 headless 的指纹一眼可辨。
+对照实测（`tools/probe_headless_parity.py`，同一台机同一条链路）：
+
+| | UA | 窗口/屏幕 | 链路结果 |
+|---|---|---|---|
+| headless | `…HeadlessChrome/153.0.0.0…` | 780×580 / 800×600 | …302/302/200/**400** → 停在 uaaap CAS 页，进不了表单页 |
+| 有头（手动登录那条路） | `…Chrome/153.0.0.0…` | 1050×940 / 1536×960 | …302/302/200/302/302/307/200 → **IDM 表单页**，取验证码 200 |
+
+**修法**：`dorm_login.disguise_headless()` —— 通过 CDP
+`Network.setUserAgentOverride`（`HeadlessChrome` → `Chrome`）+
+`Emulation.setDeviceMetricsOverride`（1280×800 / 屏幕 1536×864）把 headless 伪装成普通桌面 Chrome；
+在 `owned_browser(headless=True)` 里自动应用，任何异常都只返回 False，绝不影响登录本身。
+
+**验证**：
+1. `tools/probe_headless_disguise.py`：伪装后的 headless 与有头**逐跳一致**，取验证码 200、
+   模型识别 0.9998（报告 `.tools/headless_disguise_report.txt`）。
+2. `tools/verify_unattended_login.py`：用**独立的临时 store** + 一个失效会话，按
+   `login(interactive=False)`（与晚间自动续期**完全同一入口**）真跑一遍 →
+   一次通过、约 11 秒、**全程无窗口**、会话正常保存：
+   ```
+   22:42:07 无人值守：headless 会话已按普通 Chrome 伪装（UA/视口/屏幕）…
+   22:42:09 旧会话未接上：清空学校 cookie，改用干净会话重走链路
+   22:42:13 第 1 次：用会话 cookie 提交（1 枚…）
+   22:42:14 第 1 次：认证通过（判据=header，验证码 7109，置信度 1.000，HTTP 302，X-AuthErrorCode=0）
+   22:42:18 登录完成：会话已保存（学号 222025321102104，cookie 11 个）
+   ```
+3. 全量测试：**569 passed, 1 skipped**（含发布/签名工作流新增的用例）。
+
+**构建与打包验证**：
+- 首个 1.6.6 产物（15:47）**不含** headless 伪装修复（该修复当晚 22:35 才写出来）；
+  22:43 用同一套脚本重建。重建时 `VERSION` 已被**并行进行的发布/签名工作流**改成
+  **1.6.9**（17:45，同一工作区还改了 `build_msi.ps1`（新增冻结版 GUI 启动自检）、
+  update/签名相关测试、README、图标），因此最终产物版本号是 **1.6.9**，
+  内容 = 本文件所述全部登录修复 + 那条工作流的改动。
+- 构建：`.\build_msi.ps1 -VerifyPayload` → 成功；`Frozen GUI boot check passed` +
   `WiX manifest covers all 1759 bundle files` + `MSI payload verified: 1759 files match`；
-- `dist\youziauth.msi`：71,436,084 字节，ProductVersion **1.6.6**（直接查 MSI 数据库确认）；
-- SHA-256：`B8CE52BB06CEBCAF167BC93C8C54005856D4367B163E10C5CB1C7EF1CCD46D12`
-  （同时写入 `dist\youziauth-1.6.6.sha256`，沿用 `hash *file` 格式）；
-- 打包版离线自检 `dist\youziauth\youziauth.exe --dorm-self-test` → `ok: true`
-  （`dpapi` / `tk` / `playwright` 全通过，未做任何登录或学校请求）。
+- `dist\youziauth.msi`：71,444,276 字节（22:45:06），ProductVersion **1.6.9**（查 MSI 数据库确认）；
+  `dist\youziauth\youziauth.exe` / `youziauth-agent.exe` 时间戳 22:43:58 / 22:44:00；
+- SHA-256：`2A397A49F9A3835F35578824D4B81A963114EC2E3C9FBF0EFA66AA7921193752`
+  （`dist\youziauth-1.6.9.sha256`，沿用 `hash *file` 格式）；
+- 打包版离线自检 `--dorm-self-test` → `ok: true`（`build\qa\self-test-1.6.6-r2.json`：
+  `dpapi` / `tk` / `playwright` 全通过，未做任何登录或学校请求）；
+- **冻结版里"确实编进了伪装修复"的现场证据**：重装后无人值守那次 `login.log` 里会出现
+  `无人值守：headless 会话已按普通 Chrome 伪装…` —— 那一行由**冻结代码**写出，
+  出现即证明打包内容正确（PYZ 是压缩的，无法用字符串搜索核对）。
 
 ## 1.2.1 登录迁移修复（2026-09-21）
 
