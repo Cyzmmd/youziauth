@@ -184,6 +184,7 @@ class DesktopBridgeTests(unittest.TestCase):
         self.controller.store.save_settings(Settings(enabled=True, start='22:00', end='23:00', interval=600))
         result = self.bridge.dispatch('location_source_save', {'location_source': 'simulation'})
         self.assertTrue(result['ok'], result['message'])
+        self.assertEqual(result['message'], '定位来源已切换为模拟定位（非实时）')
         saved = self.controller.store.settings()
         self.assertEqual(saved.location_source, 'simulation')
         self.assertEqual((saved.enabled, saved.start, saved.end, saved.interval),

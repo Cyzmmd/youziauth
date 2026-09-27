@@ -36,7 +36,7 @@ navigate();
 $('date-label').textContent = new Intl.DateTimeFormat('zh-CN',{month:'long',day:'numeric',weekday:'long'}).format(new Date());
 
 function badge(id, text, tone='') {$(id).textContent=text;$(id).className='badge'+(tone ? ' '+tone : '');}
-function sourceSummary(simulation) {return simulation?'模拟定位（已保存样本）':'真实定位（Windows / Wi-Fi）';}
+function sourceSummary(simulation) {return simulation?'模拟定位':'真实定位（Windows / Wi-Fi）';}
 function markDirty(kind, value) {
   dirty[kind] = value;
   $(kind+'-save-state').textContent = value ? '有未保存的修改' : '设置已同步';

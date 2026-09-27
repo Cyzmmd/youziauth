@@ -220,7 +220,7 @@ test('native location select restores the saved source without performing action
   const h=harness('simulation');await settle();
   const select=h.el('location-source');
   assert.equal(select.tagName,'SELECT');
-  assert.deepEqual(select.options,[{value:'windows',text:'真实定位（Windows / Wi-Fi）'},{value:'simulation',text:'模拟定位（已保存样本）'}]);
+  assert.deepEqual(select.options,[{value:'windows',text:'真实定位（Windows / Wi-Fi）'},{value:'simulation',text:'模拟定位'}]);
   assert.equal(select.value,'simulation');
   assert.equal(h.calls.length,0);
   h.data.dorm.settings.location_source='windows';await h.refresh();
@@ -347,7 +347,8 @@ test('a failed snapshot blocks even a matching source and recovery reads the rea
 test('simulation detection is clearly non-live and requires no Windows permission',async()=>{
   const h=harness('simulation');await settle();
   assert.equal(h.el('authorize-location').textContent,'检测模拟定位');
-  assert.match(h.el('overview-location-source').textContent,/模拟/);
+  // 概览行的定位来源只写来源本身，不再重复「（已保存样本）」这句说明。
+  assert.equal(h.el('overview-location-source').textContent,'模拟定位');
   // 定位来源卡片只保留选择器、保存按钮与检测框：说明行与来源徽标已删除。
   const markup=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
   assert.doesNotMatch(markup,/location-source-badge|location-source-scope/);
@@ -385,6 +386,19 @@ test('the removed verbose location paragraphs stay out of the markup',()=>{
   assert.doesNotMatch(html,/自动执行需电脑开机/);
   assert.doesNotMatch(html,/随机偏移/);
   assert.doesNotMatch(html,/已保存的模拟位置（非实时）/);
+});
+
+test('the removed page hints stay out of the markup',()=>{
+  const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
+  // 依据用户标注逐页删掉的长说明：运行记录分享提醒、校园网托盘说明、寝室打卡静默登录说明、软件更新图标与两段安装说明。
+  assert.doesNotMatch(html,/向他人分享记录前/);
+  assert.doesNotMatch(html,/关闭窗口会收到系统托盘/);
+  assert.doesNotMatch(html,/保存后，登录时会自动点/);
+  assert.doesNotMatch(html,/发现新正式版后自动下载安装包/);
+  assert.doesNotMatch(html,/确认后将重新验证安装包并打开安装向导/);
+  assert.doesNotMatch(html,/section-mark"><i class="bi bi-arrow-clockwise"/);
+  // 「（已保存样本）」不再出现在下拉选项里，来源名称本身就是完整文案。
+  assert.doesNotMatch(html,/模拟定位（已保存样本）/);
 });
 
 for(const saved of ['windows','simulation']){

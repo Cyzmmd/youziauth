@@ -44,7 +44,7 @@
         <div class="page-heading"><div><div class="eyebrow">保持连接，专注当下</div><h1 id="network-title">校园网</h1><p class="muted">保存账号后，一次检测即可确认连接状态。</p></div><span class="section-mark"><i class="bi bi-wifi" aria-hidden="true"></i></span></div>
         <div class="paper-card status-banner"><div><span class="little-label">当前连接</span><h2 id="network-status">等待检测</h2><p class="muted" id="checked-label">尚未检测</p></div><button class="primary" data-action="network_check">立即检测 <i class="bi bi-arrow-right" aria-hidden="true"></i></button></div>
         <div class="detail-grid"><form class="paper-card form-card" id="network-form"><h3>账号与连接设置</h3><p class="muted small">使用校园网账号，与寝室打卡的学校登录分别管理。</p><label for="username">校园网账号</label><input id="username" name="username" placeholder="请输入校园网账号" autocomplete="username" required maxlength="120"><label for="password">校园网密码</label><div class="password-field"><input id="password" name="password" type="password" placeholder="已保存时留空即可保留" autocomplete="new-password"><button type="button" id="toggle-password" aria-label="显示密码" aria-pressed="false"><i class="bi bi-eye" aria-hidden="true"></i></button></div><p class="field-hint" id="password-hint">密码加密保存在本机，不会回填到页面。</p><div class="setting-row"><div><label for="interval">检测间隔</label><p class="field-hint">建议保留 60 秒</p></div><div class="number-field"><input id="interval" name="interval" type="number" min="5" max="3600" step="1" value="60" required><span>秒</span></div></div><label class="switch-row" for="startup"><span>开机自启动<small>修改此项会请求 Windows 管理员授权</small></span><input id="startup" type="checkbox" role="switch"></label><div class="form-footer"><span class="form-state" id="network-save-state">设置已同步</span><button type="submit" class="primary">保存设置</button></div></form>
-        <aside class="side-stack"><article class="paper-card compact"><h3><i class="bi bi-arrow-repeat" aria-hidden="true"></i> 后台检测</h3><p class="muted">定期检查网络，在需要时尝试重新认证。</p><span class="badge" id="monitor-badge">未开启</span><div class="stack-actions"><button class="primary" data-action="network_start">开启后台检测</button><button class="secondary" data-action="network_stop">停止后台检测</button></div><p class="field-hint" id="agent-hint">开启前请先保存设置。</p></article><article class="quiet-note"><i class="bi bi-info-circle" aria-hidden="true"></i><p>关闭窗口会收到系统托盘。需要彻底停止本程序时，请选择“退出程序”；开机自启动的系统代理单独运行。</p></article></aside></div>
+        <aside class="side-stack"><article class="paper-card compact"><h3><i class="bi bi-arrow-repeat" aria-hidden="true"></i> 后台检测</h3><p class="muted">定期检查网络，在需要时尝试重新认证。</p><span class="badge" id="monitor-badge">未开启</span><div class="stack-actions"><button class="primary" data-action="network_start">开启后台检测</button><button class="secondary" data-action="network_stop">停止后台检测</button></div><p class="field-hint" id="agent-hint">开启前请先保存设置。</p></article></aside></div>
       </section>
 
       <section class="page" id="dorm" aria-labelledby="dorm-title" hidden>
@@ -65,7 +65,7 @@
             <label for="location-source">选择定位来源</label>
             <select id="location-source" name="location_source" required>
               <option value="windows">真实定位（Windows / Wi-Fi）</option>
-              <option value="simulation">模拟定位（已保存样本）</option>
+              <option value="simulation">模拟定位</option>
             </select>
             <button class="primary full" id="save-location-source" type="button">保存定位来源</button>
             <div class="location-check" aria-live="polite"><p id="location-message">点击下方按钮请求系统授权并检测实时定位，不会提交打卡。</p><small id="location-checked">仅检测定位，不会提交打卡</small></div>
@@ -82,7 +82,6 @@
               <input id="idm-username" name="idm_username" type="text" maxlength="64" autocomplete="username" placeholder="统一认证学号">
               <label for="idm-password">密码</label>
               <input id="idm-password" name="idm_password" type="password" maxlength="128" autocomplete="current-password" placeholder="留空则保持已保存的密码">
-              <p class="field-hint">保存后，登录时会自动点「统一认证登录」进入账号密码页，填好学号密码、识别 4 位数字验证码并提交；最多自动尝试 2 次，之后交回人工。凭据用 Windows DPAPI 加密，仅存本机当前用户；本机被完全控制时可被解密。</p>
               <div class="form-footer">
                 <span class="form-state" id="idm-save-state"></span>
                 <button type="submit" class="primary">保存凭据</button>
@@ -128,9 +127,9 @@
         </article>
       </dialog>
 
-      <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre></article><p class="field-hint">向他人分享记录前，请检查并隐藏账号、IP 等个人信息。</p></section>
+      <section class="page" id="records" aria-labelledby="records-title" hidden><div class="page-heading"><div><div class="eyebrow">每一步，都有迹可循</div><h1 id="records-title">运行记录</h1><p class="muted">查看最近的连接检测与寝室打卡结果。</p></div><button class="secondary" id="refresh-records"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> 刷新记录</button></div><article class="paper-card records-card"><div class="records-header"><div class="segmented" role="group" aria-label="记录类型"><button class="selected" data-log="network" aria-pressed="true">校园网</button><button data-log="dorm" aria-pressed="false">寝室打卡</button></div><span class="little-label">仅保存在本机</span></div><div id="empty-records" class="empty-state"><i class="bi bi-journal-text" aria-hidden="true"></i><h2>还没有运行记录</h2><p class="muted">完成一次检测或任务查询后，记录会出现在这里。</p></div><pre id="log-output" tabindex="0" hidden></pre></article></section>
       <section class="page" id="updates" aria-labelledby="updates-title" hidden>
-        <div class="page-heading"><div><div class="eyebrow">保持最新，安装由你确认</div><h1 id="updates-title">软件更新</h1><p class="muted">启动后在后台检查最新正式版，不影响你继续使用。</p></div><span class="section-mark"><i class="bi bi-arrow-clockwise" aria-hidden="true"></i></span></div>
+        <div class="page-heading"><div><div class="eyebrow">保持最新，安装由你确认</div><h1 id="updates-title">软件更新</h1><p class="muted">启动后在后台检查最新正式版，不影响你继续使用。</p></div></div>
         <article class="paper-card compact update-card">
           <div class="card-label"><h3>版本与下载</h3><span id="update-status" class="badge">等待读取</span></div>
           <div class="update-versions"><div class="info-row"><span>当前版本</span><strong id="update-current-version">正在读取…</strong></div><div class="info-row"><span>最新正式版</span><strong id="update-latest-version">尚未检查</strong></div></div>
@@ -139,7 +138,7 @@
           <div class="update-download"><div class="info-row"><span id="update-progress-label">下载进度</span><span id="update-download-size">尚未下载</span></div><progress id="update-progress" max="100" value="0" aria-labelledby="update-progress-label" aria-describedby="update-download-size" hidden></progress></div>
           <div class="task-actions"><button id="check-updates" type="button" class="secondary" disabled>检查更新</button><button id="install-update" type="button" class="primary" hidden disabled>安装更新</button></div>
         </article>
-        <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · Cyzmmd/youziauth</p><p>发现新正式版后自动下载安装包，并验证哈希与签名；不安装较旧版本。安装必须由你明确确认，不会自动退出程序。</p><p>确认后将重新验证安装包并打开安装向导。Windows 会请求管理员授权；安装期间会关闭本程序与系统代理，完成后需重新打开程序。请先保存所有设置。</p></div></article>
+        <article class="quiet-note update-policy"><i class="bi bi-shield-check" aria-hidden="true"></i><div><p>更新来源：GitHub Releases · Cyzmmd/youziauth</p></div></article>
       </section>
       <footer class="page-footer"><span>youziauth · 校园日常</span><span>简单一点，从容一点。</span></footer>
     </main>

@@ -431,7 +431,7 @@ class DesktopBridge(LocationProbe):
         if current.location_source != source:
             self._dorm.save(dataclasses.replace(current, location_source=source))
             self._reset_location(source)
-        return ('定位来源已切换为模拟定位（非实时，使用已保存样本）' if source == 'simulation'
+        return ('定位来源已切换为模拟定位（非实时）' if source == 'simulation'
                 else '定位来源已切换为真实定位（Windows / Wi-Fi）')
 
     def simulation_map(self):

@@ -20,7 +20,7 @@ It is now a first-class part of the 寝室打卡 page sidebar:
 
 | Item | Value |
 | --- | --- |
-| Sources | `windows` (真实定位 Windows / Wi-Fi) and `simulation` (模拟定位，已保存样本) |
+| Sources | `windows` (真实定位 Windows / Wi-Fi) and `simulation` (模拟定位) |
 | Scope | Global: location check, manual submission, automatic check-in |
 | Persistence | `Settings.location_source` in the dorm store; survives restart |
 | Bridge action | `location_source_save` with `{location_source}`; keeps every other saved field |
@@ -55,7 +55,7 @@ information. The card border accent was dropped as well.
   - the selector, save button and current-source badge are all inside the first screen
     (select y=448, button y=530, badge y=585 of 768);
   - picking 模拟定位 enables the save button within a render tick, saving switches the badge
-    to 当前来源 · 模拟定位（非实时）, the overview row to 模拟定位（已保存样本） and the
+    to 当前来源 · 模拟定位（非实时）, the overview row to 模拟定位 and the
     detection button to 检测模拟定位;
   - the hint becomes 模拟定位使用本机已保存样本，并非当前位置。
 
