@@ -53,3 +53,5 @@
 .map-toggle input{margin:0}
 .map-card .form-footer{margin-top:14px;border-top:1px solid var(--border);padding-top:14px}
 .map-card .text-button{margin-top:10px}
+.map-card #map-basemap-note{color:var(--muted)}
+.map-card #map-basemap-note.warn{color:var(--red)}

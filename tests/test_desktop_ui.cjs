@@ -8,7 +8,12 @@ const path=require('node:path');
 function updateFixture(overrides={}){
   return {state:'idle',current_version:'1.4.4',latest_version:'',progress:0,downloaded_bytes:0,total_bytes:0,checked:'',message:'等待后台检查更新。',busy:false,...overrides};
 }
-function harness(source='windows'){
+function stubContext(){
+  // The drawing path only issues canvas calls; a recorder-free stub lets the map tests run it.
+  return {clearRect(){},fillRect(){},save(){},restore(){},beginPath(){},moveTo(){},lineTo(){},
+          stroke(){},fill(){},arc(){},setLineDash(){},fillText(){},drawImage(){}};
+}
+function harness(source='windows',extras={}){
   const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
   const elements=new Map(),actions=[],navigation=[];
   for(const match of html.matchAll(/<(\w+)\b([^>]*)>/g)){
@@ -17,7 +22,9 @@ function harness(source='windows'){
     const classes=new Set((attributes.class||'').split(/\s+/));
     if(!id&&!action&&!classes.has('nav-link'))continue;
     const element={
-      id,tagName:match[1].toUpperCase(),value:attributes.value||'',checked:false,
+      id,tagName:match[1].toUpperCase(),value:attributes.value||'',
+      // Read the attribute, not a bare default: index.html ships 在线底图 already checked.
+      checked:/\schecked(?:\s|$)/.test(match[2]),
       hidden:/\shidden(?:\s|$)/.test(match[2]),disabled:/\sdisabled(?:\s|$)/.test(match[2]),open:false,
       textContent:'',firstChild:{textContent:''},dataset:action?{action}:{},attributes,hash:attributes.href||'',
       options:[],children:[],
@@ -42,6 +49,9 @@ function harness(source='windows'){
     element.value=element.options[0]?.value||'';
   }
   const el=id=>{assert.ok(elements.has(id),'Missing UI node: '+id);return elements.get(id);};
+  const canvas=elements.get('map-canvas');
+  if(canvas)canvas.getContext=()=>stubContext();
+  if(canvas&&extras.canvasRect)canvas.getBoundingClientRect=()=>extras.canvasRect;
   const stop=actions.find(button=>button.dataset.action==='network_stop');
   const data={preview:true,update:updateFixture(),location:{state:'idle',message:'尚未检测',accuracy:null,checked:'',busy:false},network:{username:'saved',interval:60,startup:false,monitoring:true,busy:false,state:'online',message:'online',checked:'',has_password:true},dorm:{state:'idle',message:'pending',busy:false,task:null,settings:{enabled:false,start:'21:00',end:'23:30',interval:300,location_source:source},schedule:'off'},logs:{network:'',dorm:''}};
   const calls=[];
@@ -51,7 +61,8 @@ function harness(source='windows'){
     points:[{id:'p1',name:'本机采样样本',latitude:29.823693,longitude:106.422310,accuracy:100,
              source:'SAMPLE',saved_at:'2026-09-24T09:40:00+08:00',active:true}],
     active_id:'p1',
-    tile_url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',attribution:'© OpenStreetMap contributors',max_zoom:19};
+    tile_url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',attribution:'© OpenStreetMap contributors',max_zoom:19,
+    ...(extras.providers?{providers:extras.providers}:{})};
   const api={snapshot:async()=>structuredClone(data),dispatch:async(action,payload)=>{
     calls.push({action,payload});
     if(action==='dorm_save')Object.assign(data.dorm.settings,payload);
@@ -97,7 +108,11 @@ function harness(source='windows'){
     return {ok:true,message:'操作完成'};
   },simulation_map:async()=>structuredClone(map)};
   const context=vm.createContext({console,URLSearchParams,Intl,Date,Promise,
-    location:{hash:'#network',search:''},setInterval(){},setTimeout(){},clearTimeout(){},
+    location:{hash:'#network',search:''},setInterval(){},
+    // Tile loading needs globals the real window has but the sandbox does not: without them the
+    // picker must still work, which is exactly what the untouched tests keep proving.
+    setTimeout:extras.setTimeout||function(){},clearTimeout:extras.clearTimeout||function(){},
+    Image:extras.Image,getComputedStyle:extras.getComputedStyle,
     window:{addEventListener(){},scrollTo(){},pywebview:{api}},
     document:{getElementById:id=>elements.get(id)||null,
       createElement(tag){return {tagName:String(tag).toUpperCase(),value:'',textContent:'',selected:false};},
@@ -854,9 +869,14 @@ test('zoom is clamped and recentring returns to the school point',async()=>{
 });
 
 test('the basemap can be switched off without losing the picker',async()=>{
-  const h=harness('simulation');await settle();
-  await openMap(h);
-  h.el('map-tiles').checked=true;h.el('map-tiles').listeners.change();
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();
+  await openMap(h);await settle();
+  assert.equal(vm.runInContext('mapCredit(mapState)',h.context),'',
+               'nothing is drawn yet, so there is no third-party data to credit');
+  images.drain().forEach(image=>image.onload());await settle();
   assert.equal(vm.runInContext('mapCredit(mapState)',h.context),'© OpenStreetMap contributors',
                'the map data keeps its credit, drawn on the canvas instead of a paragraph');
   h.el('map-tiles').checked=false;h.el('map-tiles').listeners.change();
@@ -881,17 +901,327 @@ test('the picker still works before the school publishes a point',async()=>{
   assert.ok(h.calls.some(c=>c.action==='simulation_point_save'));
 });
 
-test('the basemap host is allowed by the content security policy',async()=>{
+/* Basemap providers, retries and failover -------------------------------------------------- */
+const PROVIDERS=[
+  {id:'osm',name:'OpenStreetMap',crs:'wgs84',max_zoom:19,
+   url:'https://tile.openstreetmap.org/{z}/{x}/{y}.png',attribution:'© OpenStreetMap contributors'},
+  {id:'amap',name:'高德地图',crs:'gcj02',max_zoom:18,
+   url:'https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+   attribution:'© 高德地图'},
+];
+function bridgeTileUrls(){
+  // Read the shipped provider table straight out of the bridge so the CSP cannot drift from it.
+  const source=fs.readFileSync(path.join(__dirname,'../desktop_bridge.py'),'utf8');
+  const start=source.indexOf('TILE_PROVIDERS = (');
+  assert.ok(start>=0,'desktop_bridge.py must still declare TILE_PROVIDERS');
+  const block=source.slice(start,source.indexOf('\n)\n',start));
+  return [...block.matchAll(/'url':\s*((?:\s*'[^']*')+)/g)]
+    .map(match=>[...match[1].matchAll(/'([^']*)'/g)].map(part=>part[1]).join(''));
+}
+function fakeTimers(){
+  const queue=[];
+  return {setTimeout(fn,ms){const job={fn,ms,cancelled:false};queue.push(job);return job;},
+          clearTimeout(job){if(job)job.cancelled=true;},
+          // run() fires everything queued; run(delay) only the jobs with that delay, so a test can
+          // drive tile retries without also tripping the stall guard.
+          run(...delays){
+            for(const job of queue.splice(0,queue.length)){
+              if(job.cancelled)continue;
+              if(delays.length&&!delays.includes(job.ms)){queue.push(job);continue;}
+              job.fn();
+            }
+          }};
+}
+function fakeImages(){
+  const created=[];
+  function FakeImage(){const image={src:'',onload:null,onerror:null,naturalWidth:256};created.push(image);return image;}
+  return {FakeImage,created,drain(){return created.splice(0,created.length);}};
+}
+
+test('every basemap provider is allowed by the image policy and nothing else is',async()=>{
   const html=fs.readFileSync(path.join(__dirname,'../desktop_ui/index.html'),'utf8');
   const csp=html.match(/Content-Security-Policy" content="([^"]+)"/)[1];
-  const imagePolicy=csp.split(';').map(part=>part.trim()).find(part=>part.startsWith('img-src'));
+  const policy=name=>csp.split(';').map(part=>part.trim()).find(part=>part.startsWith(name));
+  const imagePolicy=policy('img-src'),connectPolicy=policy('connect-src');
   assert.ok(imagePolicy,'the page must state an img-src policy');
   assert.match(imagePolicy,/'self'/, 'same-origin images stay allowed');
-  const h=harness('simulation');await settle();
+  // The basemap is images only: no script, fetch or socket is opened to a third party.
+  assert.equal(connectPolicy,"connect-src 'self'",'the picker must not open a third-party socket');
+
+  // Compare the policy against the table the bridge actually ships, not against a fourth copy kept
+  // here: renaming a tile host must fail this test rather than silently CSP-block the fallback.
+  const shipped=bridgeTileUrls();
+  assert.equal(shipped.length,2,'the bridge ships a preferred and a fallback provider');
+  const origins=shipped.map(url=>new URL(url.replace(/\{[zxy]\}/g,'1')).origin);
+  for(const origin of origins)
+    assert.ok(imagePolicy.includes(origin),'img-src must name the shipped provider '+origin);
+  const remote=[...new Set(csp.match(/https:\/\/[^\s;]+/g)||[])].sort();
+  assert.deepEqual(remote,[...new Set(origins)].sort(),
+                   'the picker adds exactly the shipped provider origins and nothing else');
+
+  // ...and the UI walks the table in the order it was handed, without reordering it.
+  const h=harness('simulation',{providers:PROVIDERS});await settle();
   await openMap(h);
-  const host=new URL(h.map.tile_url.replace('{z}','17').replace('{x}','1').replace('{y}','1')).host;
-  assert.ok(imagePolicy.includes(host),'img-src must name the basemap host '+host);
-  assert.equal((csp.match(/https:\/\//g)||[]).length,1,'the picker adds exactly one remote origin');
+  assert.deepEqual(vm.runInContext('mapProviders(mapState).map(provider => provider.url)',h.context),
+                   PROVIDERS.map(provider=>provider.url));
+  assert.equal(h.map.tile_url,shipped[0],
+               'the fixture and the shipped table must agree, or this test proves nothing');
+});
+
+test('a tile that fails once is retried instead of poisoning the basemap',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  const first=images.drain();
+  assert.ok(first.length>0,'the picker requests tiles');
+  first.forEach(image=>image.onerror());
+  const attempts=()=>vm.runInContext('Object.values(mapState.tiles).map(tile => tile.attempts)',h.context);
+  assert.ok(attempts().every(count=>count===1),'one failure is not a write-off');
+  assert.equal(vm.runInContext('mapBasemapFailed(mapState)',h.context),false);
+  timers.run(1200,4000);await settle();
+  assert.ok(images.created.length>0,'a failed tile is requested again');
+  assert.ok(attempts().every(count=>count===2),'the retry is counted, not restarted');
+  assert.equal(vm.runInContext('mapBasemapFailed(mapState)',h.context),false,
+               'a pending retry is not reported as a failure');
+});
+
+test('a basemap that never loads says so and offers a retry',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  for(let round=0;round<4;round+=1){images.drain().forEach(image=>image.onerror());timers.run(1200,4000);await settle();}
+  assert.equal(vm.runInContext('mapBasemapFailed(mapState)',h.context),true);
+  assert.equal(h.el('map-basemap-note').hidden,false,'a dead basemap must not be silent');
+  assert.match(h.el('map-basemap-note').textContent,/离线网格/);
+  assert.equal(h.el('map-basemap-retry').hidden,false,'the user needs a way to try again');
+
+  // Pressing retry starts over from the preferred provider with a clean slate.
+  h.el('map-basemap-retry').onclick();await settle();
+  assert.equal(h.el('map-basemap-retry').hidden,true);
+  assert.equal(h.el('map-basemap-note').textContent,'正在加载在线底图…');
+  assert.ok(images.drain().length>0,'retrying re-requests the tiles');
+});
+
+test('a basemap that hangs instead of failing still hands over to the fallback',async()=>{
+  // The reported bug: the tiles neither loaded nor errored, so an image handler never fired and
+  // the picker sat on a bare grid for good. Only a stall guard can see that.
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{providers:PROVIDERS,Image:images.FakeImage,
+                                setTimeout:timers.setTimeout,clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  assert.equal(vm.runInContext('mapState.provider_index',h.context),0);
+  assert.ok(images.drain().length>0,'the preferred provider is asked first');
+  assert.equal(vm.runInContext('mapBasemapFailed(mapState)',h.context),false,
+               'a request still in flight is not a failure');
+  // Filter by the guard's own delay: changing MAP_TILE_STALL must break this test, because the
+  // window is a deliberate user-facing latency budget, not an implementation detail.
+  timers.run(8000);await settle();
+  assert.equal(vm.runInContext('mapState.provider_index',h.context),1,'the stall hands the frame over');
+  assert.match(images.created[0].src,/autonavi/,'the fallback is asked for it');
+});
+
+test('a basemap that hangs with no fallback left is reported, not left blank',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  images.drain();
+  timers.run(8000);await settle();          // the stall window, pinned by its delay
+  assert.equal(vm.runInContext('mapBasemapFailed(mapState)',h.context),true);
+  assert.match(h.el('map-basemap-note').textContent,/离线网格/);
+  assert.equal(h.el('map-basemap-retry').hidden,false);
+});
+
+test('a dead preferred basemap fails over to the fallback provider on its own',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{providers:PROVIDERS,Image:images.FakeImage,
+                                setTimeout:timers.setTimeout,clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  assert.equal(vm.runInContext('mapState.provider_index',h.context),0);
+  assert.match(images.created[0].src,/openstreetmap/,'the preferred provider goes first');
+
+  // Three answers each: two retries, then the third failure is terminal and the fallback takes over.
+  for(let round=0;round<3;round+=1){images.drain().forEach(image=>image.onerror());timers.run(1200,4000);await settle();}
+  await settle();
+  assert.equal(vm.runInContext('mapState.provider_index',h.context),1,'it moves to the fallback');
+  const fallback=images.created.find(image=>/autonavi/.test(image.src));
+  assert.ok(fallback,'the fallback provider is asked for the same frame');
+  fallback.onload();await settle();
+  assert.equal(vm.runInContext('mapCredit(mapState)',h.context),'© 高德地图',
+               'the credit follows the provider that actually drew');
+  assert.match(h.el('map-basemap-note').textContent,/备用底图：高德地图/);
+  assert.equal(h.el('map-basemap-note').classList.contains('warn'),false);
+});
+
+test('the fallback provider caps the zoom at the level it actually serves',async()=>{
+  const h=harness('simulation',{providers:PROVIDERS});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  assert.equal(vm.runInContext('mapMaxZoom(mapState)',h.context),19);
+  vm.runInContext('mapState.provider_index=1;mapState.zoom=19;renderMap()',h.context);
+  assert.equal(mapZoom(h),18,'高德 serves nothing past 18, so the frame stops there');
+  vm.runInContext('zoomMap(5)',h.context);
+  assert.equal(mapZoom(h),18);
+});
+
+test('a GCJ02 basemap shifts the tiles, never the coordinates',async()=>{
+  const h=harness('simulation',{providers:PROVIDERS});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  // The browser and dorm_location.wgs84_to_gcj02 must agree on the offset, or a picked point
+  // would land hundreds of metres from the campus drawn underneath it.
+  const gcj=vm.runInContext('mapToGcj02(29.823693,106.422310)',h.context);
+  assert.ok(Math.abs(gcj.latitude-29.821209490450343)<1e-9,'latitude offset matches the bridge');
+  assert.ok(Math.abs(gcj.longitude-106.42634346477006)<1e-9,'longitude offset matches the bridge');
+  const outside=vm.runInContext('mapToGcj02(51.5,-0.1)',h.context);
+  assert.equal(outside.latitude,51.5,'outside China there is no offset');
+  assert.equal(outside.longitude,-0.1);
+  // A WGS84 provider draws on the plain WGS84 grid.
+  const plain=vm.runInContext('mapTileCentre(mapState)',h.context);
+  assert.equal(plain.latitude,mapCentre(h).latitude);
+  assert.equal(plain.longitude,mapCentre(h).longitude);
+  // The GCJ02 provider draws its own offset grid...
+  vm.runInContext('mapState.provider_index=1',h.context);
+  const offset=vm.runInContext('mapTileCentre(mapState)',h.context);
+  assert.ok(Math.abs(offset.latitude-mapCentre(h).latitude)>0.002,'the tile grid is offset');
+  // ...while the frame the user clicks in stays WGS84, so a centre click is the centre point.
+  clickMap(h,320,180);
+  assert.ok(Math.abs(mapPicked(h).latitude-mapCentre(h).latitude)<1e-6);
+  assert.ok(Math.abs(mapPicked(h).longitude-mapCentre(h).longitude)<1e-6);
+});
+
+test('the GCJ02 tile offset cancels against WGS84 markers to sub-pixel accuracy',async()=>{
+  // The whole alignment argument: a marker drawn from WGS84 must land where the GCJ02 tile grid
+  // puts that same place. The offset field is only locally constant, so this is an approximation -
+  // measure it instead of trusting it, and fail if it ever stops being sub-pixel.
+  const h=harness('simulation',{providers:PROVIDERS});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  vm.runInContext('mapState.provider_index=1',h.context);          // the GCJ02 provider
+  const measured=vm.runInContext(`(() => {
+    const size=mapSize($('map-canvas'));
+    const grid={...mapState,center:mapTileCentre(mapState)};
+    const offset=Math.abs(grid.center.latitude-mapState.center.latitude);
+    let worst=0;
+    for(const dx of [-size.width/2,0,size.width/2])for(const dy of [-size.height/2,0,size.height/2]){
+      const point=mapPointAt(mapState,size,size.width/2+dx,size.height/2+dy);
+      const marker=mapScreen(mapState,point.latitude,point.longitude,size);
+      const gcj=mapToGcj02(point.latitude,point.longitude);
+      const tile=mapScreen(grid,gcj.latitude,gcj.longitude,size);
+      worst=Math.max(worst,Math.hypot(marker.x-tile.x,marker.y-tile.y));
+    }
+    return {worst,offset,zoom:mapState.zoom};
+  })()`,h.context);
+  assert.ok(measured.offset>0.002,'the tile grid must actually be offset, or this proves nothing');
+  assert.ok(measured.worst<2,
+            `marker and basemap disagree by ${measured.worst.toFixed(2)} px at zoom ${measured.zoom}`);
+});
+
+test('a reload while tiles are in flight must not strand them',async()=>{
+  // Saving, switching, renaming or deleting a point reloads the model with the dialog still open.
+  // applyMapModel replaces the state object but keeps the tile map, so anything that identified a
+  // live tile by comparing the state object silently lost its repaint, its retry and its failover.
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  const inFlight=images.drain();
+  assert.ok(inFlight.length>0,'tiles were requested');
+  inFlight[0].onload();await settle();
+  await vm.runInContext('reloadMap()',h.context);await settle();
+  assert.equal(vm.runInContext('mapTileCounts(mapState).ready',h.context),1,
+               'the tile that arrived before the reload is still on the map');
+
+  const attempts=()=>vm.runInContext('Object.values(mapState.tiles).map(tile => tile.attempts)',h.context);
+  inFlight.slice(1).forEach(image=>image.onerror());
+  assert.ok(attempts().every(count=>count===1));
+  timers.run(1200,4000);await settle();
+  assert.ok(images.created.length>0,'a reload must not strand in-flight tiles without a retry');
+  assert.equal(attempts().filter(count=>count===2).length,inFlight.length-1,
+               'every stranded tile is retried, not just one');
+});
+
+test('one tile arriving must not disarm the deadline on the others',async()=>{
+  // The single global stall guard stands down as soon as anything is drawn. Without a per-tile
+  // deadline the rest of the frame can hang for good with no retry and an empty status line.
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  const first=images.drain();
+  first[0].onload();await settle();
+  timers.run(8000);await settle();               // the others never load and never error
+  assert.equal(images.created.length,0,'the deadline itself issues no request');
+  timers.run(1200,4000);await settle();          // ...it schedules the same retry an error would
+  assert.ok(images.created.length>0,'a hung tile must be retried even when the frame is not empty');
+  const attempts=vm.runInContext('Object.values(mapState.tiles).map(tile => tile.attempts)',h.context);
+  assert.equal(attempts.filter(count=>count===2).length,first.length-1,
+               'every hung tile is retried, exactly once so far');
+});
+
+test('a late tile clears the offline message it contradicts',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  const first=images.drain();
+  timers.run(8000);await settle();               // nothing drawn and no fallback left: it reports
+  assert.equal(h.el('map-basemap-retry').hidden,false);
+  assert.match(h.el('map-basemap-note').textContent,/离线网格/);
+  first[0].onload();await settle();
+  assert.equal(vm.runInContext('mapTileCounts(mapState).ready',h.context),1);
+  assert.equal(h.el('map-basemap-note').hidden,true,
+               'the grid is gone, so the warning about the grid must go too');
+  assert.equal(h.el('map-basemap-retry').hidden,true);
+});
+
+test('closing the picker clears the basemap warning and the retry control',async()=>{
+  const timers=fakeTimers(),images=fakeImages();
+  const h=harness('simulation',{Image:images.FakeImage,setTimeout:timers.setTimeout,
+                                clearTimeout:timers.clearTimeout});
+  h.el('map-tiles').checked=true;await settle();await openMap(h);await settle();
+  images.drain();
+  timers.run(8000);await settle();
+  assert.equal(h.el('map-basemap-note').hidden,false);
+  h.el('map-close').onclick();await settle();
+  assert.equal(h.el('map-basemap-note').hidden,true,'a closed picker shows no status line');
+  assert.equal(h.el('map-basemap-note').textContent,'');
+  assert.equal(h.el('map-basemap-retry').hidden,true);
+
+  // And reopening after a failure starts clean rather than inheriting the warning.
+  await openMap(h);await settle();
+  assert.equal(h.el('map-basemap-note').textContent,'正在加载在线底图…');
+  assert.equal(h.el('map-basemap-retry').hidden,true);
+});
+
+test('a click is read through the padding box, not the border box',async()=>{
+  // offsetX is measured from the padding edge while getBoundingClientRect returns the border box.
+  // Scaling by the border box skews every pick further out the closer it is to the right and bottom
+  // edges - about a metre at zoom 17, and a canvas pixel is a metre. Measured on the real window:
+  // the frame is 1 px, the canvas is 720x400 displayed at 713x396 of padding box.
+  const width=720,height=400;
+  const rect={left:201,top:280.390625,width:715,height:398.109375};   // border box, 1 px frame
+  const padding={width:rect.width-2,height:rect.height-2};
+  const h=harness('simulation',{canvasRect:rect,
+    getComputedStyle:()=>({borderLeftWidth:'1px',borderRightWidth:'1px',
+                           borderTopWidth:'1px',borderBottomWidth:'1px'})});
+  h.el('map-canvas').width=width;h.el('map-canvas').height=height;
+  await settle();await openMap(h);await settle();
+  for(const target of [{x:100,y:120},{x:359,y:200},{x:610,y:330}]){
+    // A real pointer reports whole CSS pixels; aim at the canvas pixel we want and click.
+    const offsetX=target.x*padding.width/width,offsetY=target.y*padding.height/height;
+    clickMap(h,offsetX,offsetY);
+    // The pick is stored rounded to six decimals (about 0.11 m), which is far finer than the
+    // ~1 px skew this test exists to catch.
+    const expected=vm.runInContext(
+      `(() => {const point=mapPointAt(mapState,{width:${width},height:${height}},${target.x},${target.y});
+               return {latitude:mapRound(point.latitude),longitude:mapRound(point.longitude)};})()`,
+      h.context);
+    const picked=mapPicked(h);
+    assert.equal(picked.latitude,expected.latitude,
+                 `click at canvas ${JSON.stringify(target)} landed off the padding-box pixel`);
+    assert.equal(picked.longitude,expected.longitude,
+                 `click at canvas ${JSON.stringify(target)} landed off the padding-box pixel`);
+  }
 });
 
 test('dragging pans the map and never drops a marker',async()=>{

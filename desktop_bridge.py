@@ -24,13 +24,32 @@ from dorm_location import (PICK_SOURCE, distance_metres, gcj02_to_wgs84, map_pic
 from dorm_panel import DormController
 
 
-# The picker draws a real map, so tiles come from a third party. OpenStreetMap is used because it
-# needs no key and its licence is clear; the UI can switch the basemap off, and everything except
-# the tiles (grid, radius, markers, distance) keeps working offline.
-TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
-TILE_ATTRIBUTION = '© OpenStreetMap contributors'
-TILE_MAX_ZOOM = 19
+# The picker draws a real map, so tiles come from a third party. OpenStreetMap stays first because
+# it needs no key and its licence is clear, but its tile servers are run by volunteers who block
+# app-like traffic - measured here as HTTP 200 plus an "Access blocked" PNG and an `x-blocked`
+# response header - and they are frequently unreachable from mainland China. So one keyless
+# fallback sits behind it: 高德 answers the same z/x/y grid, and the UI applies the GCJ02 offset
+# itself, so a campus still lands in the right place. With both gone the picker falls back to the
+# offline grid, and everything except the tiles (grid, radius, markers, distance) keeps working.
+TILE_PROVIDERS = (
+    {'id': 'osm', 'name': 'OpenStreetMap', 'crs': 'wgs84', 'max_zoom': 19,
+     'url': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+     'attribution': '© OpenStreetMap contributors'},
+    {'id': 'amap', 'name': '高德地图', 'crs': 'gcj02', 'max_zoom': 18,
+     'url': 'https://webrd01.is.autonavi.com/appmaptile'
+            '?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+     'attribution': '© 高德地图'},
+)
+# The preferred provider stays readable under the names the bridge used before it had a fallback.
+TILE_URL = TILE_PROVIDERS[0]['url']
+TILE_ATTRIBUTION = TILE_PROVIDERS[0]['attribution']
+TILE_MAX_ZOOM = TILE_PROVIDERS[0]['max_zoom']
 SIMULATION_SAMPLE = 'location-sample.json'
+
+
+def tile_providers():
+    """A fresh copy per call: the UI must never be able to mutate the module's own table."""
+    return [dict(provider) for provider in TILE_PROVIDERS]
 
 
 def network_settings(payload, previous):
@@ -432,7 +451,8 @@ class DesktopBridge(LocationProbe):
                 'distance_m': distance, 'in_range': in_range,
                 'points': [dict(entry, active=entry['id'] == state['active']) for entry in state['points']],
                 'active_id': state['active'],
-                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM}
+                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM,
+                'providers': tile_providers()}
 
     def _sync_simulation_points(self, store):
         """Make the list and the replayed sample agree, with the list as the source of truth.
@@ -663,7 +683,8 @@ class PreviewBridge(LocationProbe):
                 'distance_m': distance, 'in_range': in_range,
                 'points': [dict(entry, active=entry['id'] == named['active']) for entry in named['points']],
                 'active_id': named['active'],
-                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM}
+                'tile_url': TILE_URL, 'attribution': TILE_ATTRIBUTION, 'max_zoom': TILE_MAX_ZOOM,
+                'providers': tile_providers()}
 
     def _preview_points(self):
         return self._data['simulation']['points']

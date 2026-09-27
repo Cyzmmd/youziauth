@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <!-- The map picker is the only feature that loads a third-party resource: the OpenStreetMap
-       basemap tiles, named explicitly below. Everything else stays same-origin. -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <!-- The map picker is the only feature that loads third-party resources: the basemap tiles,
+       named explicitly below and nowhere else. Everything else stays same-origin. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' data:; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self'; img-src 'self' data: https://tile.openstreetmap.org https://webrd01.is.autonavi.com; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
   <title>youziauth · 校园日常</title>
   <link rel="stylesheet" href="icons/icons.css">
   <link rel="stylesheet" href="style.css">
@@ -118,7 +118,9 @@
             <button type="button" class="secondary" id="map-zoom-out" aria-label="缩小地图">缩小</button>
             <button type="button" class="secondary" id="map-recenter">回到学校位置</button>
             <label class="map-toggle" for="map-tiles"><input type="checkbox" id="map-tiles" checked> 在线底图</label>
+            <button type="button" class="secondary" id="map-basemap-retry" hidden>重试底图</button>
           </div>
+          <p class="field-hint" id="map-basemap-note" role="status" aria-live="polite" hidden></p>
           <div class="form-footer">
             <button type="button" class="primary" id="map-save" disabled>保存为选点</button>
           </div>

@@ -9,6 +9,8 @@ let api;
 let mapState = null;
 let mapDrag = null, mapSuppressPick = false, mapNameFor = null;
 const MAP_TILE = 256, MAP_MIN_ZOOM = 13, MAP_MAX_ZOOM = 19;
+const MAP_TILE_TRIES = 3, MAP_TILE_BACKOFF = [1200, 4000];  // ms before each retry of one tile
+const MAP_TILE_STALL = 8000;   // ms with nothing drawn before the next provider takes the frame
 
 function notify(message, error=false) {
   clearTimeout(timer);
@@ -284,6 +286,118 @@ function mapY(lat,zoom){const s=Math.sin(lat*Math.PI/180);return (0.5-Math.log((
 function mapLng(x,zoom){return x/mapScale(zoom)*360-180;}
 function mapLat(y,zoom){const n=Math.PI-2*Math.PI*y/mapScale(zoom);return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n)));}
 function mapMetresPerPixel(lat,zoom){return 156543.03392*Math.cos(lat*Math.PI/180)/Math.pow(2,zoom);}
+function mapToGcj02(latitude,longitude){
+  // Byte-for-byte the same offset dorm_location.wgs84_to_gcj02 applies, so the browser and the
+  // bridge cannot disagree about where a GCJ02 basemap draws a place.
+  if(!(longitude>=72.004&&longitude<=137.8347&&latitude>=0.8293&&latitude<=55.8271))
+    return {latitude,longitude};
+  const x=longitude-105,y=latitude-35,ee=.00669342162296594323;
+  let a=-100+2*x+3*y+.2*y*y+.1*x*y+.2*Math.sqrt(Math.abs(x));
+  let b=300+x+2*y+.1*x*x+.1*x*y+.1*Math.sqrt(Math.abs(x));
+  const wave=(20*Math.sin(6*x*Math.PI)+20*Math.sin(2*x*Math.PI))*2/3;
+  a+=wave+(20*Math.sin(y*Math.PI)+40*Math.sin(y*Math.PI/3))*2/3;
+  a+=(160*Math.sin(y*Math.PI/12)+320*Math.sin(y*Math.PI/30))*2/3;
+  b+=wave+(20*Math.sin(x*Math.PI)+40*Math.sin(x*Math.PI/3))*2/3;
+  b+=(150*Math.sin(x*Math.PI/12)+300*Math.sin(x*Math.PI/30))*2/3;
+  const rad=latitude*Math.PI/180,magic=1-ee*Math.pow(Math.sin(rad),2),root=Math.sqrt(magic);
+  a=a*180/((6378245*(1-ee))/(magic*root)*Math.PI);
+  b=b*180/(6378245/root*Math.cos(rad)*Math.PI);
+  return {latitude:latitude+a,longitude:longitude+b};
+}
+/* Basemap providers -------------------------------------------------------------------------
+   Tiles come from a third party, and that third party can fail. OpenStreetMap's volunteer servers
+   block app-like traffic outright (HTTP 200 plus an "Access blocked" PNG and an `x-blocked`
+   header) and are slow, or entirely unreachable, from mainland China. Worse, a request can simply
+   hang: no load, no error, which is the bare-grid report this change fixes. So tiles are retried,
+   a provider that draws nothing within MAP_TILE_STALL hands the frame to the next one, and the
+   status line says which provider is drawing.
+   There is deliberately no pre-flight probe. One was written first and had to be dropped: on a
+   measured campus connection the very first HEAD request to OpenStreetMap from a cold WebView2
+   timed out at 30 s while the tiles themselves arrived, so probing only replaced a working basemap
+   with the fallback. The block case is not detectable from an <img> at all - the block body is a
+   perfectly valid PNG - and it is left to the status line to say the basemap is not coming. */
+function mapProviders(state){
+  const listed=(state&&state.providers||[]).filter(provider=>provider&&provider.url);
+  if(listed.length)return listed;
+  // Bridges from before the fallback shipped send one provider as three loose fields.
+  return state&&state.tile_url
+    ?[{id:'default',name:'',url:state.tile_url,attribution:state.attribution||'',
+       max_zoom:state.max_zoom||MAP_MAX_ZOOM,crs:'wgs84'}]
+    :[];
+}
+function mapProvider(state){
+  const list=mapProviders(state);
+  return list[(state&&state.provider_index)||0]||list[0]||null;
+}
+function mapTileUrl(provider,zoom,x,y){
+  return provider.url.replace('{z}',zoom).replace('{x}',x).replace('{y}',y);
+}
+function mapMaxZoom(state){
+  const provider=mapProvider(state);
+  const limit=provider&&provider.max_zoom?provider.max_zoom:MAP_MAX_ZOOM;
+  return Math.max(MAP_MIN_ZOOM,Math.min(MAP_MAX_ZOOM,limit));
+}
+function mapTileCentre(state,provider){
+  // A GCJ02 provider draws its own offset grid. Projecting tiles from the offset centre while
+  // markers and picks stay on the plain WGS84 centre makes the offset cancel, so campus features
+  // and pins line up while every coordinate the picker produces is still WGS84. It is exact only
+  // while the offset is locally constant; measured over the whole zoom range on the campus this is
+  // used at (.scratch/wb2probe/gcj_alignment.py) the residual stays under ~1.1 px, and 0.5 px at
+  // the zoom the picker opens on - far below the 7 px marker dot and the 100 m+ check-in radius.
+  const chosen=provider||mapProvider(state);
+  if(!chosen||chosen.crs!=='gcj02')return state.center;
+  return mapToGcj02(state.center.latitude,state.center.longitude);
+}
+function mapTileCounts(state){
+  // Only the level on screen counts. drawMapTiles skips every other level, so a stale-zoom tile
+  // must not decide the credit, the failover or the status line either.
+  const tiles=Object.entries(state.tiles||{})
+    .filter(([key])=>Number(key.split('/')[0])===state.zoom)
+    .map(entry=>entry[1]);
+  return {total:tiles.length,ready:tiles.filter(tile=>tile.ready).length,
+          failed:tiles.filter(tile=>tile.failed).length,
+          pending:tiles.filter(tile=>!tile.ready&&!tile.failed).length};
+}
+function mapBasemapFailed(state){
+  if(state.basemap_stalled)return true;
+  const counts=mapTileCounts(state);
+  return counts.failed>0&&counts.ready===0&&counts.pending===0;
+}
+function mapStopStall(state){
+  if(state.basemap_stall)clearTimeout(state.basemap_stall);
+  state.basemap_stall=null;
+}
+function mapDropTiles(state){
+  mapStopStall(state);
+  for(const tile of Object.values(state.tiles||{}))if(tile.timer)clearTimeout(tile.timer);
+  state.tiles={};
+  state.basemap_stalled=false;
+}
+function mapFailOver(state){
+  // Hand the frame to the next provider. Bounded: it only ever walks forward.
+  const list=mapProviders(state);
+  const next=(state.provider_index||0)+1;
+  if(next>=list.length)return false;
+  state.provider_index=next;
+  mapDropTiles(state);
+  if(mapState===state)renderMap();
+  return true;
+}
+function mapWatchStall(state){
+  // The fast path for a frame where nothing at all has drawn: fail over at once instead of letting
+  // every tile burn its own deadline and retries first. A partly-drawn frame keeps its tiles and
+  // relies on their individual deadlines, so this guard is not the only way out of a hang.
+  if(state.basemap_stall||state.basemap_stalled)return;
+  state.basemap_stall=setTimeout(()=>{
+    state.basemap_stall=null;
+    if(mapState!==state)return;
+    const counts=mapTileCounts(state);
+    if(!counts.total||counts.ready)return;      // map data arrived after all
+    if(mapFailOver(state))return;
+    state.basemap_stalled=true;                 // nothing left to try: report it instead of waiting
+    renderMap();
+  },MAP_TILE_STALL);
+}
 function mapDistance(from,to){
   const radius=6371000,first=from.latitude*Math.PI/180,second=to.latitude*Math.PI/180;
   const dLat=second-first,dLng=(to.longitude-from.longitude)*Math.PI/180;
@@ -292,18 +406,28 @@ function mapDistance(from,to){
 }
 function mapSize(canvas){return {width:canvas.width||640,height:canvas.height||360};}
 function mapEventPoint(event){
-  // Canvas coordinates, not CSS pixels: the canvas is stretched to the dialog width.
+  // Canvas coordinates, not CSS pixels: the canvas is stretched to the dialog width. offsetX is
+  // measured from the padding edge while getBoundingClientRect returns the border box, so the 1 px
+  // frame has to come off before scaling - dividing by the border box skews every pick outwards as
+  // it approaches the right and bottom edges, by about a metre at zoom 17.
   const canvas=$('map-canvas');
   let x=event.offsetX,y=event.offsetY;
   if(typeof x!=='number'||typeof y!=='number')return null;
   const rect=canvas.getBoundingClientRect?canvas.getBoundingClientRect():null;
-  if(rect&&rect.width&&canvas.width){x=x*canvas.width/rect.width;y=y*canvas.height/rect.height;}
+  if(rect&&rect.width&&canvas.width){
+    const style=typeof getComputedStyle==='function'?getComputedStyle(canvas):null;
+    const borderX=style?(parseFloat(style.borderLeftWidth)||0)+(parseFloat(style.borderRightWidth)||0):0;
+    const borderY=style?(parseFloat(style.borderTopWidth)||0)+(parseFloat(style.borderBottomWidth)||0):0;
+    const innerWidth=rect.width-borderX,innerHeight=rect.height-borderY;
+    x=x*canvas.width/(innerWidth>0?innerWidth:rect.width);
+    y=y*canvas.height/(innerHeight>0?innerHeight:rect.height);
+  }
   return {x,y};
 }
 function zoomMap(step){
   if(!mapState)return;
-  mapState.zoom=Math.max(MAP_MIN_ZOOM,Math.min(MAP_MAX_ZOOM,mapState.zoom+step));
-  mapState.tiles={};                       // a new zoom needs new tiles
+  mapState.zoom=Math.max(MAP_MIN_ZOOM,Math.min(mapMaxZoom(mapState),mapState.zoom+step));
+  mapDropTiles(mapState);                  // a new zoom needs new tiles
   renderMap();
 }
 function panMap(dx,dy){
@@ -361,18 +485,87 @@ function drawMapGrid(ctx,state,size){
 }
 function drawMapTiles(ctx,state,size){
   if(!state.useTiles||!state.tiles)return;
-  const centreX=mapX(state.center.longitude,state.zoom),centreY=mapY(state.center.latitude,state.zoom);
+  const centre=mapTileCentre(state);
+  const centreX=mapX(centre.longitude,state.zoom),centreY=mapY(centre.latitude,state.zoom);
   for(const [key,tile] of Object.entries(state.tiles)){
     const [zoom,x,y]=key.split('/').map(Number);
     if(zoom!==state.zoom||!tile.ready)continue;
     ctx.drawImage(tile.image,x*MAP_TILE-(centreX-size.width/2),y*MAP_TILE-(centreY-size.height/2),MAP_TILE,MAP_TILE);
   }
 }
+function mapTileOwner(key,tile){
+  // A tile is live iff the picker still holds this exact object under this key. Comparing the state
+  // object instead was a bug: a reload (saving, switching, renaming or deleting a point with the
+  // dialog open) replaces mapState but keeps the tile map, so every in-flight tile lost its
+  // repaint, its retry and its share of the failover.
+  return mapState&&mapState.tiles&&mapState.tiles[key]===tile?mapState:null;
+}
+function mapTileDeadline(key,tile){
+  // A request can hang: no load, no error. That is the failure this whole change exists for, so
+  // every tile carries its own deadline - one tile arriving must not excuse the others.
+  clearTimeout(tile.timer);
+  tile.timer=setTimeout(()=>{
+    tile.timer=null;
+    if(!mapTileOwner(key,tile)||tile.ready||tile.failed)return;
+    mapTileFailed(key,tile);
+  },MAP_TILE_STALL);
+}
+function mapStartTile(state,key,tile){
+  const provider=mapProvider(state);
+  if(!provider)return;
+  const [zoom,x,y]=key.split('/').map(Number);
+  tile.attempts+=1;
+  tile.ready=false;
+  tile.failed=false;
+  const image=new Image();
+  tile.image=image;
+  image.onload=()=>{
+    const live=mapTileOwner(key,tile);     // a provider switch or a close retires the tile
+    if(!live)return;
+    tile.ready=true;
+    live.basemap_stalled=false;            // a late tile contradicts "nothing is coming"
+    renderMap();
+  };
+  image.onerror=()=>{
+    if(!mapTileOwner(key,tile))return;
+    mapTileFailed(key,tile);
+  };
+  image.src=mapTileUrl(provider,zoom,x,y);
+  mapTileDeadline(key,tile);
+}
+function mapTileFailed(key,tile){
+  const state=mapTileOwner(key,tile);
+  if(!state)return;
+  tile.ready=false;
+  clearTimeout(tile.timer);
+  if(tile.attempts<MAP_TILE_TRIES){
+    // A blip must not poison the tile for the rest of the session: this used to be a one-way
+    // "failed" flag, so one dropped request left a bare grid until the dialog was reopened.
+    tile.timer=setTimeout(()=>{
+      tile.timer=null;
+      const live=mapTileOwner(key,tile);
+      if(!live)return;
+      mapStartTile(live,key,tile);
+    },MAP_TILE_BACKOFF[Math.min(tile.attempts-1,MAP_TILE_BACKOFF.length-1)]);
+    return;
+  }
+  tile.failed=true;
+  if(mapCheckBasemap(state))renderMap();   // nothing left to try: show it on the status line
+}
+function mapCheckBasemap(state){
+  const counts=mapTileCounts(state);
+  if(!counts.total)return false;
+  if(counts.ready||counts.pending)return false;
+  if(mapFailOver(state))return false;
+  return true;
+}
 function loadMapTiles(state,size){
-  if(!state.useTiles||!state.tile_url||typeof Image!=='function')return;
-  const zoom=Math.max(MAP_MIN_ZOOM,Math.min(MAP_MAX_ZOOM,state.zoom));
+  if(!state.useTiles||typeof Image!=='function')return;
+  if(!mapProvider(state))return;
+  const zoom=Math.max(MAP_MIN_ZOOM,Math.min(mapMaxZoom(state),state.zoom));
   state.tiles=state.tiles||{};
-  const centreX=mapX(state.center.longitude,zoom),centreY=mapY(state.center.latitude,zoom);
+  const centre=mapTileCentre(state);
+  const centreX=mapX(centre.longitude,zoom),centreY=mapY(centre.latitude,zoom);
   const span=Math.pow(2,zoom);
   const first={x:Math.floor((centreX-size.width/2)/MAP_TILE),y:Math.floor((centreY-size.height/2)/MAP_TILE)};
   const last={x:Math.floor((centreX+size.width/2)/MAP_TILE),y:Math.floor((centreY+size.height/2)/MAP_TILE)};
@@ -380,12 +573,11 @@ function loadMapTiles(state,size){
     if(y<0||y>=span)continue;
     const column=((x%span)+span)%span,key=zoom+'/'+column+'/'+y;
     if(state.tiles[key])continue;
-    const image=new Image();
-    state.tiles[key]={image,ready:false};
-    image.onload=()=>{state.tiles[key].ready=true;if(mapState===state)renderMap();};
-    image.onerror=()=>{state.tiles[key].failed=true;};
-    image.src=state.tile_url.replace('{z}',zoom).replace('{x}',column).replace('{y}',y);
+    const tile={image:null,ready:false,failed:false,attempts:0,timer:null};
+    state.tiles[key]=tile;
+    mapStartTile(state,key,tile);
   }
+  if(!mapTileCounts(state).ready)mapWatchStall(state);
 }
 function drawMapMarker(ctx,point,colour,label){
   ctx.save();ctx.beginPath();ctx.arc(point.x,point.y,7,0,Math.PI*2);
@@ -405,8 +597,36 @@ function mapSavedLabel(state){
 }
 function mapCredit(state){
   // The map data needs its credit; the licence asks for it, so it is drawn on the canvas instead
-  // of taking a paragraph of its own. Off with the basemap, because then no map data is shown.
-  return state.useTiles?(state.attribution||'© OpenStreetMap contributors'):'';
+  // of taking a paragraph of its own. Only while third-party data is actually on the canvas: with
+  // the basemap off, or with every tile still failing, the grid underneath is ours alone.
+  if(!state.useTiles)return '';
+  if(!mapTileCounts(state).ready)return '';
+  const provider=mapProvider(state);
+  return (provider&&provider.attribution)||state.attribution||'© OpenStreetMap contributors';
+}
+function mapBasemapNote(state){
+  // The reported bug was silence: a failed basemap and a switched-off one looked identical.
+  if(!state.useTiles)return '';
+  const counts=mapTileCounts(state);
+  const onFallback=(state.provider_index||0)>0;
+  const provider=mapProvider(state);
+  if(mapBasemapFailed(state))
+    return '在线底图暂时连不上，已回退离线网格。点「重试底图」可再试一次。';
+  if(counts.ready&&onFallback&&provider&&provider.name)
+    return '首选底图暂时连不上，已改用备用底图：'+provider.name+'。';
+  if(!counts.ready&&counts.pending)return '正在加载在线底图…';
+  return '';
+}
+function renderBasemapState(state){
+  const note=$('map-basemap-note');
+  if(note){
+    const text=mapBasemapNote(state);
+    note.hidden=!text;
+    note.textContent=text;
+    note.classList.toggle('warn',mapBasemapFailed(state));
+  }
+  const retry=$('map-basemap-retry');
+  if(retry)retry.hidden=!mapBasemapFailed(state);
 }
 function drawMap(ctx,canvas,state){
   const size=mapSize(canvas);
@@ -481,6 +701,9 @@ function renderMap(){
   const canvas=$('map-canvas');
   if(!canvas||!mapState)return;
   mapState.useTiles=$('map-tiles').checked;
+  // 高德 has no zoom 19: past its top level the tiles come back blank, so the frame follows the
+  // provider's own ceiling instead of the global one.
+  mapState.zoom=Math.max(MAP_MIN_ZOOM,Math.min(mapMaxZoom(mapState),mapState.zoom));
   $('map-distance-badge').textContent=mapBadge(mapState);
   $('map-summary').textContent=mapState.reference
     ? '学校打卡点：'+(mapState.reference.address||'以学校任务为准')+'，允许半径约 '+
@@ -490,19 +713,29 @@ function renderMap(){
   renderPoints();
   const ctx=canvas.getContext?canvas.getContext('2d'):null;
   if(ctx)drawMap(ctx,canvas,mapState);
+  // After the draw, never before: the status line reports the tile state the draw just settled.
+  renderBasemapState(mapState);
 }
 function applyMapModel(model){
   const centre=model.reference||model.point||mapState?.center||{latitude:0,longitude:0};
+  // A reload (saving or switching a point) keeps the provider the picker already settled on.
   mapState={...model,center:{latitude:centre.latitude,longitude:centre.longitude},
-            zoom:mapState?.zoom||17,picked:null,tiles:mapState?.tiles||{}};
+            zoom:mapState?.zoom||17,picked:null,tiles:mapState?.tiles||{},
+            provider_index:mapState?.provider_index||0,
+            basemap_stalled:false,basemap_stall:null};
   const dialog=$('map-dialog');
   if(dialog&&!dialog.open)dialog.showModal();
   renderMap();render();
 }
 function clearMapState(){
+  if(mapState)mapDropTiles(mapState);
   mapState=null;
   $('map-save').disabled=true;
   $('map-distance-badge').textContent='未选择位置';
+  const note=$('map-basemap-note');
+  if(note){note.hidden=true;note.textContent='';note.classList.toggle('warn',false);}
+  const retry=$('map-basemap-retry');
+  if(retry)retry.hidden=true;
 }
 function closeMap(){
   clearMapState();
@@ -535,7 +768,20 @@ $('map-recenter').onclick=()=>{
   if(target)mapState.center={latitude:target.latitude,longitude:target.longitude};
   renderMap();
 };
-$('map-tiles').addEventListener('change',()=>{if(mapState){mapState.tiles={};renderMap();}});
+$('map-tiles').addEventListener('change',()=>{
+  if(!mapState)return;
+  // Switching the basemap back on must clear a previous failure, not just the tiles.
+  mapDropTiles(mapState);
+  renderMap();
+});
+$('map-basemap-retry').onclick=()=>{
+  // Back to the preferred provider with a clean slate: the manual version of the automatic retry,
+  // for when the network came back after the dialog was already open.
+  if(!mapState)return;
+  mapState.provider_index=0;
+  mapDropTiles(mapState);
+  renderMap();
+};
 $('map-canvas').addEventListener('wheel',event=>{
   if(!mapState)return;
   event.preventDefault();

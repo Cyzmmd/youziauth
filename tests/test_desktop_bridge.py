@@ -283,6 +283,40 @@ class SimulationMapTests(unittest.TestCase):
         self.assertIn('openstreetmap.org', model['tile_url'])
         self.assertIn('OpenStreetMap', model['attribution'])
 
+    def test_the_model_offers_the_basemap_fallbacks_in_order(self):
+        """The UI walks this list: preferred first, then whatever can still draw the campus."""
+        model = self.bridge.simulation_map()
+        providers = model['providers']
+        self.assertEqual([entry['id'] for entry in providers], ['osm', 'amap'])
+        self.assertEqual(providers[0]['url'], model['tile_url'],
+                         'the legacy single-provider fields must describe the first entry')
+        self.assertEqual(providers[0]['max_zoom'], model['max_zoom'])
+        self.assertEqual(providers[0]['crs'], 'wgs84')
+        for entry in providers:
+            for placeholder in ('{z}', '{x}', '{y}'):
+                self.assertIn(placeholder, entry['url'])
+            self.assertTrue(entry['attribution'], 'every provider needs a credit on the canvas')
+            self.assertIsInstance(entry['max_zoom'], int)
+        fallback = providers[1]
+        self.assertEqual(fallback['crs'], 'gcj02', 'a GCJ02 basemap needs the offset the UI applies')
+        self.assertEqual(fallback['max_zoom'], 18, 'the fallback serves nothing past zoom 18')
+
+    def test_every_provider_host_is_a_named_https_origin(self):
+        """The UI's CSP has to list these hosts, so a templated or relative host would break it."""
+        from urllib.parse import urlsplit
+        for entry in self.bridge.simulation_map()['providers']:
+            parts = urlsplit(entry['url'])
+            self.assertEqual(parts.scheme, 'https', entry['id'])
+            self.assertTrue(parts.hostname and '.' in parts.hostname,
+                            f'{entry["id"]} needs a host the policy can name literally')
+            self.assertNotIn('{', parts.hostname, 'the host itself must never be templated')
+
+    def test_the_provider_list_is_a_copy_the_ui_cannot_corrupt(self):
+        model = self.bridge.simulation_map()
+        model['providers'][0]['url'] = 'https://example.invalid/{z}/{x}/{y}.png'
+        self.assertEqual(self.bridge.simulation_map()['providers'][0]['url'],
+                         'https://tile.openstreetmap.org/{z}/{x}/{y}.png')
+
     def test_the_model_is_refused_while_the_saved_source_is_real_location(self):
         self.store.save_settings(Settings(location_source='windows'))
         model = self.bridge.simulation_map()
