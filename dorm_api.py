@@ -4,7 +4,12 @@ No historical form IDs, coordinates, plaintext caches or raw-response logging.
 """
 from __future__ import annotations
 
+import http.client
 import json
+import os
+import socket
+import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,12 +20,109 @@ from dorm_checkin import CheckinError, Task, now
 ORIGIN = 'https://of.swu.edu.cn'
 BASE = '/gateway/fighter-baida/api/'
 SELECT = BASE + 'form-instance/select'
+SAVE = BASE + 'form-instance/save'
+
+# 单次 API 调用的超时。它决定"学校只是在峰值排队"会不会被报成"连不上"：
+# 2026-09-28 两台机器都在 21:05 失败，耗时都比平时多约 20 秒 —— 正好是这个值。
+REQUEST_TIMEOUT_SECONDS = 20
+# 只读调用在**同一轮**里的重试间隔（失败 → 等 → 再试）。落库那次 POST 绝不重试：
+# 它的重发必须由回查证明"服务端没记录"，见 dorm_checkin.Engine._readback。
+TRANSIENT_RETRY_DELAYS = (1.0, 3.0)
+# 需要经本机代理上网时才打开（学校 API 默认直连，见 pick_route）。
+SYSTEM_PROXY_ENV = 'YOUZIAUTH_DORM_SYSTEM_PROXY'
+DIRECT = 'direct'
+SYSTEM = 'system'
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Never forward an authentication header to a login redirect or another host.
         raise CheckinError('login_required', '登录已失效，请重新登录')
+
+
+def system_proxy() -> str:
+    """本机系统代理的 `host:port`（没配置则空串）。带凭据的部分一律丢掉，不落盘。"""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:  # noqa: BLE001
+        return ''
+    value = proxies.get('https') or proxies.get('http') or ''
+    if not value:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(value if '://' in value else 'http://' + value)
+    except ValueError:
+        return ''
+    if not parts.hostname:
+        return ''
+    return f'{parts.hostname}:{parts.port}' if parts.port else parts.hostname
+
+
+def pick_route() -> str:
+    """学校 API 走哪条链路：默认直连，只有显式设置环境变量才用系统代理。
+
+    为什么默认绕开系统代理（2026-09-28 复盘）：urllib 的 build_opener 默认带
+    ProxyHandler，会**静默**继承系统代理；本机实测开着 Clash（系统代理
+    127.0.0.1:7897 + TUN），于是每一次学校请求都多经过一跳本地代理，而程序既读不到、
+    也记不下这一跳 —— 出事时无法判断失败发生在学校还是本机代理。直连让链路确定；
+    代理确实是唯一出口的机器，用 YOUZIAUTH_DORM_SYSTEM_PROXY=1 打开（仍会记进诊断）。
+    """
+    value = os.environ.get(SYSTEM_PROXY_ENV, '').strip().lower()
+    return SYSTEM if value in ('1', 'true', 'yes', 'on') else DIRECT
+
+
+def _opener(route: str):
+    handlers = [NoRedirect()]
+    if route == DIRECT:
+        handlers.append(urllib.request.ProxyHandler({}))     # 明确忽略系统代理
+    return urllib.request.build_opener(*handlers)
+
+
+def failure_kind(exc: BaseException) -> str:
+    """把传输层异常归类成受控文案用的短标签（不含异常原文）。"""
+    reason = getattr(exc, 'reason', None) or exc
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return '响应超时'
+    if isinstance(reason, socket.gaierror):
+        return '域名解析失败'
+    if isinstance(reason, ConnectionRefusedError):
+        return '连接被拒绝'
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError,
+                           http.client.RemoteDisconnected, http.client.BadStatusLine,
+                           http.client.IncompleteRead)):
+        return '连接被中断'
+    if isinstance(reason, ssl.SSLError):
+        return 'TLS 握手失败'
+    # Windows 的 WSA 错误码不走 errno 子类，只能查表（实测 Clash/校园网都会给这些）。
+    return {10060: '响应超时', 110: '响应超时',
+            10061: '连接被拒绝', 111: '连接被拒绝',
+            10054: '连接被中断', 10053: '连接被中断', 104: '连接被中断',
+            11001: '域名解析失败', 11004: '域名解析失败'}.get(
+                getattr(reason, 'errno', None), '连接失败')
+
+
+def transport_message(kind: str) -> str:
+    """同一句"请检查网络"曾经同时代表超时、被重置、DNS 失败 —— 用户和我们都无从下手。"""
+    return {
+        '响应超时': f'学校接口响应超时（{REQUEST_TIMEOUT_SECONDS:.0f} 秒未回应），请稍后重试',
+        '域名解析失败': '无法解析学校接口域名，请检查网络或代理后重试',
+        '连接被拒绝': '学校接口拒绝连接，请稍后重试',
+        '连接被中断': '与学校接口的连接被中断，请稍后重试',
+        'TLS 握手失败': '与学校接口的加密连接失败，请稍后重试',
+    }.get(kind, '无法连接学校接口，请检查网络后重试')
+
+
+def failure_note(kind: str, route: str, started: float, attempts: int = 1) -> str:
+    """一条受控的现场记录：失败类别 + 耗时 + 走了哪条链路 + 本轮试了几次。"""
+    seconds = max(0.0, time.monotonic() - started)
+    proxy = system_proxy()
+    where = '直连' if route == DIRECT else f'经系统代理 {proxy or "（未检测到地址）"}'
+    parts = [f'{kind} {seconds:.1f}s', where]
+    if route == DIRECT and proxy:
+        parts.append(f'本机系统代理 {proxy} 已绕过')
+    if attempts > 1:
+        parts.append(f'第 {attempts} 次尝试')
+    return '／'.join(parts)
 
 
 def request(method, path, token, *, query=None, body=None, form=None):
@@ -46,19 +148,27 @@ def request(method, path, token, *, query=None, body=None, form=None):
     elif body is not None:
         data = json.dumps(body, ensure_ascii=False).encode('utf-8')
         headers['Content-Type'] = 'application/json;charset=UTF-8'
+    route = pick_route()
+    started = time.monotonic()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.build_opener(NoRedirect()).open(req, timeout=20) as response:
+        with _opener(route).open(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             raw = response.read(2_000_001)
+    except urllib.error.HTTPError as exc:
+        # 服务器答了话：链路是通的，这一步不该被当成网络故障。响应体不读、也不留引用。
+        exc.close()
+        if exc.code in (401, 403):
+            raise CheckinError('login_required', '登录已失效，请重新登录') from None
+        raise CheckinError('network_error', f'学校接口暂不可用（HTTP {exc.code}），请稍后重试',
+                           detail=failure_note(f'HTTP {exc.code}', route, started)) from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        kind = failure_kind(exc)
+        raise CheckinError('network_error', transport_message(kind),
+                           detail=failure_note(kind, route, started)) from None
+    try:
         if len(raw) > 2_000_000:
             raise ValueError('oversized response')
         result = json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            raise CheckinError('login_required', '登录已失效，请重新登录') from None
-        raise CheckinError('network_error', '学校接口暂不可用，请稍后重试') from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise CheckinError('network_error', '无法连接学校接口，请检查网络后重试') from None
     except (ValueError, UnicodeError):
         raise CheckinError('error', '学校接口返回格式不正确，请重新登录或稍后重试') from None
     if not isinstance(result, dict):
@@ -78,12 +188,37 @@ def required(data, key):
 
 
 class SwuApi:
-    def __init__(self, transport=request):
+    def __init__(self, transport=request, retry_delays=None):
         self.transport = transport
+        self.retry_delays = TRANSIENT_RETRY_DELAYS if retry_delays is None else tuple(retry_delays)
+
+    def _read(self, method, path, token, **kwargs):
+        """只读调用：一次瞬时网络失败先在本轮重试，别把一个抖动拖成 5 分钟。
+
+        落库那次 POST 不走这里 —— 它的重发必须由回查证明"服务端没记录"才允许
+        （见 dorm_checkin.Engine），所以 submit() 仍然只发一次。
+        """
+        delays = list(self.retry_delays)
+        for attempt in range(len(delays) + 1):
+            if attempt:
+                time.sleep(delays[attempt - 1])
+            try:
+                return self.transport(method, path, token, **kwargs)
+            except CheckinError as exc:
+                if exc.state != 'network_error':
+                    raise                      # 需要人处理（登录/定位/格式），重试没有意义
+                if attempt == len(delays):
+                    if not attempt:
+                        raise
+                    note = f'本轮已重试 {attempt} 次'
+                    raise CheckinError(exc.state, str(exc),
+                                       detail=f'{exc.detail}／{note}' if exc.detail
+                                       else note) from None
+        raise CheckinError('network_error', '无法连接学校接口，请检查网络后重试')
 
     def user(self, token):
-        data = self.transport('GET', '/gateway/fighter-middle/api/auth/user', token,
-                              query={'appType': 'fighter-portal'})
+        data = self._read('GET', '/gateway/fighter-middle/api/auth/user', token,
+                          query={'appType': 'fighter-portal'})
         subject = data.get('subject') if isinstance(data, dict) else None
         if not isinstance(subject, dict) or not (subject.get('username') or subject.get('loginName')):
             raise CheckinError('login_required', '无法确认登录身份，请重新登录')
@@ -92,8 +227,8 @@ class SwuApi:
     def today(self, token, student, current):
         records = []
         for page in range(1, 11):
-            data = self.transport('POST', BASE + 'cqtj/getTransitionByToday', token,
-                                  form={'pageNum': str(page), 'pageSize': '50'})
+            data = self._read('POST', BASE + 'cqtj/getTransitionByToday', token,
+                              form={'pageNum': str(page), 'pageSize': '50'})
             if not isinstance(data, dict) or not isinstance(data.get('records'), list):
                 raise CheckinError('error', '今日任务列表格式不正确')
             batch = data['records']
@@ -112,8 +247,8 @@ class SwuApi:
             raise CheckinError('error', '发现多条今日查寝任务，请在学校页面选择处理')
         record = next(iter(candidates.values()))
         task_id, form_id = required(record, 'id'), required(record, 'formId')
-        data = self.transport('GET', SELECT, token,
-                              query={'dataId': task_id, 'formId': form_id, 'procDefId': ''})
+        data = self._read('GET', SELECT, token,
+                          query={'dataId': task_id, 'formId': form_id, 'procDefId': ''})
         if not isinstance(data, dict) or required(data, 'xh') != student:
             raise CheckinError('error', '任务账号与登录账号不一致，已停止')
         if data.get('tsrq') and data['tsrq'] != record['tsrq']:
@@ -130,7 +265,7 @@ class SwuApi:
         if not isinstance(times, list) or len(times) != 2:
             raise CheckinError('error', '今日任务时段不明确，已停止')
         payload = dict(data, id=task_id, cqfbid=publish_id, xh=student, tsrq=record['tsrq'])
-        dorm = self.transport('POST', BASE + 'cqlc/getDormitory', token, body=payload)
+        dorm = self._read('POST', BASE + 'cqlc/getDormitory', token, body=payload)
         fields = {}
         if isinstance(dorm, dict):
             for item in dorm.get('columnList') or []:
@@ -156,8 +291,8 @@ class SwuApi:
                     fields.get('latitude') or '', fields.get('longitude') or '')
 
     def verify(self, token, task, position):
-        data = self.transport('POST', BASE + 'cqlc/verify', token,
-                              query={'businessKey': task.id}, body={'mapData': position})
+        data = self._read('POST', BASE + 'cqlc/verify', token,
+                          query={'businessKey': task.id}, body={'mapData': position})
         if not isinstance(data, dict) or data.get('isArea') is not True:
             raise CheckinError('location_required', '学校未确认当前位置在打卡范围内，未提交')
 
@@ -169,7 +304,7 @@ class SwuApi:
         other answer - including an empty body - stays unconfirmed.
         """
         location = dict(position, isArea=True, tip='当前在签到范围内')
-        data = self.transport('POST', BASE + 'form-instance/save', token,
+        data = self.transport('POST', SAVE, token,
                               query={'formId': task.form_id, 'isSubmitProcess': 'false'}, body={
             'id': task.id, 'businessKey': task.id, 'formId': task.form_id, 'cqfbid': task.publish_id,
             'xh': task.student, 'tsrq': task.date, 'dksj': now().strftime('%Y-%m-%d %H:%M'),
@@ -179,8 +314,8 @@ class SwuApi:
         return isinstance(data, dict) and str(data.get('qdjg')) == '1'
 
     def is_signed(self, token, task):
-        data = self.transport('GET', SELECT, token,
-                              query={'dataId': task.id, 'formId': task.form_id, 'procDefId': ''})
+        data = self._read('GET', SELECT, token,
+                          query={'dataId': task.id, 'formId': task.form_id, 'procDefId': ''})
         return (isinstance(data, dict) and str(data.get('xh')) == task.student
                 and (not data.get('id') or str(data['id']) == task.id)
                 and (not data.get('tsrq') or data['tsrq'] == task.date)

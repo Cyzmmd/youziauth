@@ -1,14 +1,16 @@
 import datetime as dt
 import importlib.util
+import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
 PRESENT = importlib.util.find_spec('dorm_checkin') is not None
 if PRESENT:
-    from dorm_checkin import (CheckinError, Engine, Result, Settings, Store, SUBMIT_MAX_ATTEMPTS,
-                              Task, SHANGHAI)
+    from dorm_checkin import (CheckinError, Engine, Result, Settings, Store, SUBMIT_COOLDOWN_SECONDS,
+                              SUBMIT_MAX_ATTEMPTS, Task, SHANGHAI)
 
 
 class FeatureExists(unittest.TestCase):
@@ -370,6 +372,98 @@ class SessionStoreTests(unittest.TestCase):
             broken.browser_session('private-token')
         self.assertEqual(caught.exception.state, 'login_required')
         self.assertNotIn('private-cookie', str(caught.exception))
+
+
+@unittest.skipUnless(PRESENT, 'Engine is not implemented')
+class TransientRetryTests(unittest.TestCase):
+    """2026-09-28 现场：一次瞬时失败之后白等了 4.5 分钟（interval=300，冷却 21:06:30 就允许了）。
+
+    瞬时失败要提前重试；等人的状态（登录/定位）不许被加密节奏。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name), protector=Mock(
+            protect=lambda b: b[::-1], unprotect=lambda b: b[::-1]))
+        self.store.save_settings(Settings(enabled=True, start='21:00', end='23:30',
+                                          interval=300, location_source='simulation'))
+        self.store.save_token('private-token')
+        self.now = dt.datetime(2026, 9, 21, 22, 0, tzinfo=SHANGHAI)
+        self.task = Task('task-1', 'form-1', 'publish-1', 'student',
+                         '2026-09-21', '今日查寝', '21:00', '23:30', False, '宿舍', '800米')
+        self.api = Mock()
+        self.api.user.return_value = 'student'
+        self.api.today.return_value = self.task
+        self.api.is_signed.return_value = False
+        self.engine = Engine(self.store, self.api, Mock(return_value={'latitude': 29.8}),
+                             clock=lambda: self.now)
+
+    def delay(self):
+        seconds = self.engine.next_tick - time.monotonic()
+        self.assertGreater(seconds, 0)
+        return seconds
+
+    def failing_submit(self):
+        self.api.submit.side_effect = CheckinError(
+            'network_error', '学校接口响应超时（20 秒未回应），请稍后重试',
+            detail='响应超时 20.0s／直连')
+
+    def test_an_unrecorded_submission_comes_back_after_the_cooldown_not_the_interval(self):
+        self.failing_submit()
+        result = self.engine.tick()
+        self.assertEqual(result.state, 'ready')
+        self.assertTrue(result.retry_soon)
+        self.assertGreater(self.delay(), float(SUBMIT_COOLDOWN_SECONDS))
+        self.assertLess(self.delay(), 200, '还在等满一个 interval 就等于没修')
+
+    def test_an_unknown_submission_outcome_is_read_back_sooner(self):
+        self.store.set_pending(self.task.key)
+        self.api.is_signed.side_effect = CheckinError(
+            'network_error', '与学校接口的连接被中断，请稍后重试', detail='连接被中断 0.1s／直连')
+        result = self.engine.tick()
+        self.assertEqual(result.state, 'uncertain')
+        self.assertTrue(result.retry_soon)
+        self.assertLess(self.delay(), 200)
+
+    def test_a_transient_read_failure_is_retried_sooner(self):
+        self.api.today.side_effect = CheckinError(
+            'network_error', '学校接口响应超时（20 秒未回应），请稍后重试')
+        result = self.engine.tick()
+        self.assertEqual(result.state, 'network_error')
+        self.assertTrue(result.retry_soon)
+        self.assertLess(self.delay(), 200)
+
+    def test_a_lost_login_waits_for_the_user_instead_of_being_retried_faster(self):
+        self.api.user.side_effect = CheckinError('login_required', '登录已失效，请重新登录')
+        result = self.engine.tick()
+        self.assertEqual(result.state, 'login_required')
+        self.assertFalse(result.retry_soon)
+        self.assertGreater(self.delay(), 250)
+
+    def test_a_successful_check_in_still_waits_the_full_interval(self):
+        self.api.submit.return_value = True
+        result = self.engine.tick()
+        self.assertEqual(result.state, 'signed')
+        self.assertFalse(result.retry_soon)
+        self.assertGreater(self.delay(), 250)
+
+    def test_the_failure_class_reaches_history_and_status(self):
+        self.failing_submit()
+        self.engine.tick()
+        history = self.store.history()
+        self.assertIn('[ready] 提交未生效：学校接口响应超时（20 秒未回应），请稍后重试', history)
+        self.assertIn('响应超时 20.0s／直连', history)
+        status = json.loads((self.store.root / 'status.json').read_text(encoding='utf-8'))
+        self.assertEqual(status['detail'], '响应超时 20.0s／直连')
+        self.assertTrue(status['retry_soon'])
+
+    def test_a_clean_history_line_has_no_diagnostic_suffix(self):
+        self.api.submit.return_value = True
+        self.engine.tick()
+        line = self.store.history().splitlines()[-1]
+        self.assertIn('[signed] 服务器已确认今日任务完成', line)
+        self.assertNotIn(' · ', line)
 
 
 if __name__ == '__main__':

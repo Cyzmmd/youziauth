@@ -25,6 +25,13 @@ SUBMIT_COOLDOWN_SECONDS = 60
 SUBMIT_MAX_ATTEMPTS = 3
 SUBMIT_EXHAUSTED_MESSAGE = (f'提交未生效，自动重试已达 {SUBMIT_MAX_ATTEMPTS} 次上限；'
                             '请在学校页面核实或手动打卡')
+# 一次瞬时传输失败之后，下一次自动尝试的间隔。
+#
+# 必须**大于** SUBMIT_COOLDOWN_SECONDS：否则下一拍会被冷却挡掉，变成一条「N 秒后可重试」
+# 的空转；又必须远小于检查间隔 —— 2026-09-28 实测，21:05:30 那次「无法连接学校接口」
+# 之后白等了 4.5 分钟才重试成功（interval=300，而冷却 21:06:30 就允许了）。
+# 只对瞬时失败生效：login_required / location_required 要等人，不能靠加密节奏解决。
+TRANSIENT_RETRY_SECONDS = SUBMIT_COOLDOWN_SECONDS + 10
 
 
 def now() -> dt.datetime:
@@ -32,9 +39,13 @@ def now() -> dt.datetime:
 
 
 class CheckinError(RuntimeError):
-    def __init__(self, state: str, message: str):
+    def __init__(self, state: str, message: str, detail: str = ''):
         super().__init__(message)
         self.state = state
+        # 受控现场细节（失败类别、耗时、走了哪条链路、本轮重试了几次）。
+        # 只进 history.log 与 status.json —— 不含响应报文、token、坐标，理由同 Store.record。
+        # 2026-09-28 那次事故本地零痕迹，只能靠"多出约 20 秒"反推，就是缺这一条。
+        self.detail = detail
 
 
 def parse_time(value: str) -> dt.time:
@@ -108,6 +119,10 @@ class Result:
     message: str
     task: Task | None = None
     at: str = ''
+    # 受控现场细节：失败类别／耗时／链路／本轮重试次数（见 CheckinError.detail）。
+    detail: str = ''
+    # 是否值得把下一拍提前到 TRANSIENT_RETRY_SECONDS 之后（只影响自动路径）。
+    retry_soon: bool = False
 
 
 class Store:
@@ -283,8 +298,13 @@ class Store:
     def record(self, result):
         self._write('status.json', dataclasses.asdict(result))
         # Only controlled messages; no raw exceptions, token, response bodies or coordinates.
+        # detail 同样受控：它由 dorm_api 生成（失败类别／耗时／链路），不是异常原文。
         old = self.history().splitlines()[-99:]
-        old.append(f'{result.at} [{result.state}] {result.message}')
+        line = f'{result.at} [{result.state}] {result.message}'
+        detail = getattr(result, 'detail', '')
+        if detail:
+            line += f' · {detail}'
+        old.append(line)
         atomic_write_bytes(self.root / 'history.log', ('\n'.join(old) + '\n').encode('utf-8'))
 
     def history(self):
@@ -341,7 +361,13 @@ class Engine:
         if time.monotonic() < self.next_tick:
             return None
         self.next_tick = time.monotonic() + 60
-        return self.run(automatic=True, submit=True)
+        result = self.run(automatic=True, submit=True)
+        # 瞬时失败不要等满一个 interval：冷却一过就再试。retry_soon 只由
+        # 「传输层失败」那条路径置位（见 _unrecorded / _readback / run 的顶层 handler），
+        # 所以不会把"等人"的状态（login_required / location_required）也加密。
+        if result is not None and result.retry_soon:
+            self.next_tick = min(self.next_tick, time.monotonic() + TRANSIENT_RETRY_SECONDS)
+        return result
 
     def run(self, *, automatic=False, submit=False):
         if not self.lock.acquire(blocking=False):
@@ -438,7 +464,10 @@ class Engine:
                 return settled
             return self._unrecorded(task, reason)
         except CheckinError as exc:
-            return self._result(exc.state, str(exc), task)
+            # 传输层抖动（network_error）值得提前重试；等人处理的状态（login_required /
+            # location_required）和格式类错误（error）不加密节奏。
+            return self._result(exc.state, str(exc), task, detail=exc.detail,
+                                retry_soon=exc.state == 'network_error')
         except Exception:
             return self._result('error', '操作未完成，请检查网络、配置或稍后重试', task)
         finally:
@@ -459,10 +488,14 @@ class Engine:
             signed = self.api.is_signed(token, task)
         except CheckinError as exc:
             if exc.state == 'login_required':
-                return self._result('login_required', '登录已失效，提交结果待确认；恢复登录后仅回查', task)
-            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
+                return self._result('login_required', '登录已失效，提交结果待确认；恢复登录后仅回查',
+                                    task, detail=exc.detail)
+            # 回查本身失败：结果未知，只回查不重发 —— 但值得提前再查一次。
+            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task,
+                                detail=exc.detail, retry_soon=True)
         except Exception:
-            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task)
+            return self._result('uncertain', '提交结果待确认；将仅回查，请在学校页面核实', task,
+                                retry_soon=True)
         if signed:
             self.store.clear_pending(task.key)
             self.store.clear_attempts(task.key)
@@ -485,14 +518,18 @@ class Engine:
 
     def _unrecorded(self, task, reason):
         """A repeatable failure: say what the school said, and that another try is coming."""
+        detail = getattr(reason, 'detail', '')
         if reason is not None and reason.state in ('login_required', 'location_required'):
             # These need the user, not another POST.
-            return self._result(reason.state, f'{reason}；本次提交未记录', task)
-        detail = f'{reason}；' if reason is not None else '服务器未记录本次提交；'
-        return self._result('ready', f'提交未生效：{detail}将在检查时段内重试', task)
+            return self._result(reason.state, f'{reason}；本次提交未记录', task, detail=detail)
+        text = f'{reason}；' if reason is not None else '服务器未记录本次提交；'
+        # 回查已证明"服务器没记录"，所以重发不会被重复打卡挡住 —— 提前重试是安全的。
+        return self._result('ready', f'提交未生效：{text}将在检查时段内重试', task,
+                            detail=detail, retry_soon=True)
 
-    def _result(self, state, message, task=None):
-        result = Result(state, message, task, self.clock().isoformat(timespec='seconds'))
+    def _result(self, state, message, task=None, detail='', retry_soon=False):
+        result = Result(state, message, task, self.clock().isoformat(timespec='seconds'),
+                        detail, retry_soon)
         if state == 'signed':
             self._mark_signed(task)
         try:
